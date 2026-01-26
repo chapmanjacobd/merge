@@ -44,7 +44,6 @@ Required Fallback (one must be specified):
 - `rename-dest` - Rename destination to file_1.ext, move source to file.ext
 - `delete-src` - Delete source file
 - `delete-dest` - Delete destination, move source
-- `delete-dest-ask` - Prompt for each conflict
 
 Default: "delete-src-hash rename-dest"
 
