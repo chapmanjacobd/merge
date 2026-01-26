@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -16,7 +19,6 @@ import (
 	"github.com/alecthomas/kong"
 )
 
-// Conflict resolution modes
 type FileOverFileOpt string
 
 const (
@@ -60,11 +62,11 @@ type FileNode struct {
 	IsDir     bool
 	IsSymlink bool
 
-	info       os.FileInfo // Cached file info
+	info       os.FileInfo
 	infoLoaded bool
 	mu         sync.Mutex
-	sampleHash string // Cached sample hash
-	fullHash   string // Cached full hash
+	sampleHash string
+	fullHash   string
 }
 
 func (n *FileNode) GetInfo() (os.FileInfo, error) {
@@ -129,14 +131,9 @@ func (n *FileNode) Clone(newPath string) *FileNode {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return &FileNode{
-		Path:  newPath,
-		IsDir: n.IsDir,
-
-		IsSymlink:  n.IsSymlink,
-		info:       n.info,
-		infoLoaded: n.infoLoaded,
-		sampleHash: n.sampleHash,
-		fullHash:   n.fullHash,
+		Path:      newPath,
+		IsDir:     n.IsDir,
+		IsSymlink: n.IsSymlink,
 	}
 }
 
@@ -215,7 +212,7 @@ func (fs *FileSystem) GetOrLoad(path string) (*FileNode, bool) {
 	}
 
 	node := &FileNode{
-		Path:       path, // We use the requested path
+		Path:       path,
 		IsDir:      info.IsDir(),
 		IsSymlink:  info.Mode()&os.ModeSymlink != 0,
 		info:       info,
@@ -307,6 +304,10 @@ func (c *CLI) AfterApply() error {
 	return nil
 }
 
+type MergeJob struct {
+	Ops []MergeOperation
+}
+
 type Stats struct {
 	FilesProcessed   int64
 	FoldersProcessed int64
@@ -344,8 +345,9 @@ func (s *Stats) Print() {
 }
 
 type Program struct {
-	cli   *CLI
-	stats Stats
+	cli      *CLI
+	stats    Stats
+	destRoot string
 }
 
 func NewProgram(cli *CLI) *Program {
@@ -355,6 +357,10 @@ func NewProgram(cli *CLI) *Program {
 // sampleHash computes a hash from samples across the file for quick comparison.
 // It returns the hash string, a boolean indicating if it's a full hash, and any error.
 func sampleHash(path string, gap float64) (string, bool, error) {
+	if gap <= 0 {
+		gap = 0.1
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return "", false, err
@@ -463,7 +469,6 @@ func humanToBytes(inputStr string) int64 {
 	return int64(value * float64(multiplier))
 }
 
-// computeFullHash computes SHA-256 of entire file
 func computeFullHash(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -478,7 +483,6 @@ func computeFullHash(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// compareFiles does a two-stage comparison: sample hash then full hash
 func (p *Program) compareFiles(src, dst *FileNode) (bool, error) {
 	srcSize, err := src.GetSize()
 	if err != nil {
@@ -517,31 +521,34 @@ func (p *Program) compareFiles(src, dst *FileNode) (bool, error) {
 	return srcFull == dstFull, nil
 }
 
-func scanDirectory(root string, fs *FileSystem) ([]string, error) {
-	var paths []string
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
+func (p *Program) streamScan(root string, fs *FileSystem) <-chan string {
+	out := make(chan string, 1024)
+	go func() {
+		defer close(out)
+		filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
 
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
 
-		node := &FileNode{
-			Path:       path,
-			IsDir:      d.IsDir(),
-			IsSymlink:  d.Type()&os.ModeSymlink != 0,
-			info:       info,
-			infoLoaded: true,
-		}
-		fs.Add(path, node)
+			node := &FileNode{
+				Path:       path,
+				IsDir:      d.IsDir(),
+				IsSymlink:  d.Type()&os.ModeSymlink != 0,
+				info:       info,
+				infoLoaded: true,
+			}
+			fs.Add(path, node)
 
-		paths = append(paths, path)
-		return nil
-	})
-	return paths, err
+			out <- path
+			return nil
+		})
+	}()
+	return out
 }
 
 func getUniqueFilename(basePath string, fs *FileSystem) string {
@@ -672,6 +679,7 @@ func (p *Program) clobberFileOverFile(op *MergeOperation, src, dest *FileNode, t
 		// Keep action as move/copy, just redirect to newPath
 		op.RenamedDestPath = newPath
 	case FFRenameDest:
+		// destination needs to be renamed first
 		newPath := getUniqueFilename(targetPath, simFS)
 		// Emit rename for destination, then proceed with normal move/copy
 		*ops = append(*ops, MergeOperation{
@@ -681,9 +689,8 @@ func (p *Program) clobberFileOverFile(op *MergeOperation, src, dest *FileNode, t
 			IsDir:    dest.IsDir,
 		})
 		simFS.Delete(op.DestPath)
-		dest.Path = newPath // Update the node's internal path
-		simFS.Add(newPath, dest)
-		// Keep action as move/copy to original DestPath (now cleared)
+		simFS.Add(newPath, dest.Clone(newPath))
+		// Keep action as move/copy to original DestPath (now free)
 	default:
 		op.Action = "skip"
 	}
@@ -712,9 +719,8 @@ func (p *Program) clobber(op *MergeOperation, src, dest *FileNode, targetPath st
 			IsDir:    dest.IsDir,
 		})
 		simFS.Delete(op.DestPath)
-		dest.Path = newPath // Update the node's internal path
-		simFS.Add(newPath, dest)
-		// Keep action as move/copy to original DestPath (now cleared)
+		simFS.Add(newPath, dest.Clone(newPath))
+		// Keep action as move/copy to original DestPath (now free)
 	case CMerge:
 		if src.IsDir && !dest.IsDir {
 			// Folder over File - Merge mode requires the file to be moved out of the way
@@ -727,9 +733,8 @@ func (p *Program) clobber(op *MergeOperation, src, dest *FileNode, targetPath st
 				IsDir:    dest.IsDir,
 			})
 			simFS.Delete(op.DestPath)
-			dest.Path = newPath // Update the node's internal path
-			simFS.Add(newPath, dest)
-			// Keep action as move/copy to original DestPath (now cleared)
+			simFS.Add(newPath, dest.Clone(newPath))
+			// Keep action as move/copy to original DestPath (now free)
 		} else {
 			// Move into the conflicting folder/file
 			baseName := filepath.Base(src.Path)
@@ -742,10 +747,48 @@ func (p *Program) clobber(op *MergeOperation, src, dest *FileNode, targetPath st
 	}
 }
 
-func (p *Program) planMerge(srcRoot string, srcFS *FileSystem, srcPaths []string, destFS *FileSystem) ([]MergeOperation, *FileSystem, error) {
-	var ops []MergeOperation
-	simFS := NewFileSystem()
+func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileSystem) error {
+	pathChan := p.streamScan(srcRoot, srcFS)
 
+	// Worker pool setup
+	numWorkers := p.cli.Workers
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	jobChan := make(chan MergeJob, numWorkers*2)
+	errChan := make(chan error, 128)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobChan {
+				for _, op := range job.Ops {
+					if err := p.executeOperation(op); err != nil {
+						atomic.AddInt64(&p.stats.Errors, 1)
+						select {
+						case errChan <- fmt.Errorf("%s: %w", op.SrcPath, err):
+						default:
+							if p.cli.Verbose > 1 {
+								fmt.Fprintf(os.Stderr, "Error (buffer full): %s: %v\n", op.SrcPath, err)
+							}
+						}
+
+						fmt.Fprintf(os.Stderr, "Error in job: skipping remaining ops:\n")
+						for _, op := range job.Ops {
+							fmt.Fprintf(os.Stderr, "  %v: %s\n", op.Action, op.SrcPath)
+						}
+						break
+					}
+				}
+			}
+		}()
+	}
+
+	// Planner (runs in main routine or single goroutine to maintain state)
+	simFS := NewFileSystem()
 	// Copy existing destination into simulation
 	destFS.mu.RLock()
 	for path, node := range destFS.nodes {
@@ -769,13 +812,12 @@ func (p *Program) planMerge(srcRoot string, srcFS *FileSystem, srcPaths []string
 	if p.cli.RelativeTo != "" {
 		relRoot = p.cli.RelativeTo
 	}
-	var err error
-	relRoot, err = filepath.Abs(relRoot)
+	relRoot, err := filepath.Abs(relRoot)
 	if err != nil {
-		return nil, nil, err
+		close(jobChan)
+		return err
 	}
 
-	// Determine destination root for this source
 	destRoot := p.cli.Destination
 	isSourceDir := false
 	if info, err := os.Stat(srcRoot); err == nil && info.IsDir() {
@@ -788,17 +830,15 @@ func (p *Program) planMerge(srcRoot string, srcFS *FileSystem, srcPaths []string
 				destRoot = filepath.Join(destRoot, filepath.Base(srcRoot))
 			}
 		} else {
-			// Source is a file
 			if p.cli.Parent {
 				destRoot = filepath.Join(destRoot, filepath.Base(filepath.Dir(srcRoot)))
 			}
-
 			appendBasename := true
 			if p.cli.DestFile {
 				appendBasename = false
 			} else if p.cli.DestFolder {
 				appendBasename = true
-			} else { // DestBSD (default)
+			} else { // DestBSD
 				destExistsAsDir := false
 				if destNode, ok := destFS.Get(p.cli.Destination); ok && destNode.IsDir {
 					destExistsAsDir = true
@@ -828,37 +868,44 @@ func (p *Program) planMerge(srcRoot string, srcFS *FileSystem, srcPaths []string
 					}
 				}
 			}
-
 			if appendBasename {
 				destRoot = filepath.Join(destRoot, filepath.Base(srcRoot))
 			}
 		}
 	}
+	p.destRoot = destRoot
 
-	plannedCount := int(atomic.LoadInt64(&p.stats.FilesProcessed) + atomic.LoadInt64(&p.stats.FoldersProcessed))
-	plannedBytes := atomic.LoadInt64(&p.stats.BytesMoved)
+	// Capture initial stats before processing this source
+	initialFiles := atomic.LoadInt64(&p.stats.FilesProcessed)
+	initialFolders := atomic.LoadInt64(&p.stats.FoldersProcessed)
+	initialBytes := atomic.LoadInt64(&p.stats.BytesMoved)
 
-	for _, srcPath := range srcPaths {
-		if p.cli.Limit > 0 && plannedCount >= p.cli.Limit {
+	var scheduledFiles, scheduledFolders, scheduledBytes int64
+	for srcPath := range pathChan {
+		currentCount := int(initialFiles + initialFolders + scheduledFiles + scheduledFolders)
+		currentBytes := initialBytes + scheduledBytes
+
+		if p.cli.Limit > 0 && currentCount >= p.cli.Limit {
 			break
 		}
-		if maxBytes > 0 && plannedBytes >= maxBytes {
+		if maxBytes > 0 && currentBytes >= maxBytes {
 			break
 		}
-		if skipPrefix != "" && strings.HasPrefix(srcPath, skipPrefix) {
-			continue
+		if skipPrefix != "" {
+			cleanSrc := filepath.Clean(srcPath)
+			if strings.HasPrefix(cleanSrc, skipPrefix) {
+				continue
+			}
 		}
 
 		srcNode, _ := srcFS.Get(srcPath)
 
-		// Filter by expressions
 		if !srcNode.IsDir {
 			if !p.shouldInclude(srcPath) {
 				continue
 			}
 		}
 
-		// Calculate relative path
 		absSrcPath, err := filepath.Abs(srcPath)
 		if err != nil {
 			absSrcPath = srcPath
@@ -887,12 +934,12 @@ func (p *Program) planMerge(srcRoot string, srcFS *FileSystem, srcPaths []string
 			SrcFS:    srcFS,
 		}
 
+		var jobOps []MergeOperation
+
 		hasFilters := len(p.cli.Ext) > 0 || len(p.cli.Include) > 0 || len(p.cli.Exclude) > 0 || p.cli.Limit > 0 || maxBytes > 0
 
-		// Check for conflicts
 		destNode, exists := simFS.GetOrLoad(destPath)
 		if !exists && srcNode.IsDir && (hasFilters || p.cli.Limit > 0 || maxBytes > 0) {
-			// Force merge mode for directories if filters or limits are present to ensure recursion
 			exists = true
 			destNode = &FileNode{IsDir: true}
 		}
@@ -901,13 +948,10 @@ func (p *Program) planMerge(srcRoot string, srcFS *FileSystem, srcPaths []string
 			atomic.AddInt64(&p.stats.Conflicts, 1)
 
 			if srcNode.IsDir && destNode.IsDir {
-				// Folder over folder - typically merge
 				op.Action = "merge"
 			} else if !srcNode.IsDir && !destNode.IsDir {
-				// File over file
 				op.Action = "transfer"
-				p.clobberFileOverFile(&op, srcNode, destNode, destPath, fileStrategy, simFS, &ops)
-				// Apply simulation updates
+				p.clobberFileOverFile(&op, srcNode, destNode, destPath, fileStrategy, simFS, &jobOps)
 				if op.DeleteDest {
 					simFS.Delete(op.DestPath)
 				}
@@ -919,11 +963,9 @@ func (p *Program) planMerge(srcRoot string, srcFS *FileSystem, srcPaths []string
 					simFS.Add(finalPath, srcNode.Clone(finalPath))
 				}
 			} else if !srcNode.IsDir && destNode.IsDir {
-				// File over folder
 				op.Action = "transfer"
 				mode := ConflictMode(p.cli.FileOverFolder)
-				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &ops)
-				// Apply simulation updates
+				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &jobOps)
 				if op.DeleteDest {
 					simFS.Delete(op.DestPath)
 				}
@@ -935,11 +977,9 @@ func (p *Program) planMerge(srcRoot string, srcFS *FileSystem, srcPaths []string
 					simFS.Add(finalPath, srcNode.Clone(finalPath))
 				}
 			} else {
-				// Folder over file
 				op.Action = "transfer"
 				mode := ConflictMode(p.cli.FolderOverFile)
-				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &ops)
-				// Apply simulation updates
+				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &jobOps)
 				if op.DeleteDest {
 					simFS.Delete(op.DestPath)
 				}
@@ -953,40 +993,53 @@ func (p *Program) planMerge(srcRoot string, srcFS *FileSystem, srcPaths []string
 			}
 
 		} else {
-			// No conflict
 			op.Action = "transfer"
 			simFS.Add(destPath, srcNode.Clone(destPath))
 		}
 
 		if op.Action != "merge" && op.Action != "skip" || op.DeleteSrc || op.DeleteDest {
-			ops = append(ops, op)
-			plannedCount++
+			jobOps = append(jobOps, op)
+
+			// Send job
+			jobChan <- MergeJob{Ops: jobOps}
+
 			if !op.IsDir {
 				sz, _ := srcNode.GetSize()
-				plannedBytes += sz
+				scheduledBytes += sz
+				scheduledFiles++
+			} else {
+				scheduledFolders++
 			}
-			// If we are moving/copying a directory as a whole, skip its children
+
 			if (op.Action == "transfer" || op.Action == "rename" || op.DeleteSrc) && op.IsDir {
-				skipPrefix = srcPath + string(filepath.Separator)
-				// Add children to simFS so subsequent merges know they exist
-				finalDest := op.DestPath
-				if op.RenamedDestPath != "" {
-					finalDest = op.RenamedDestPath
-				}
-				srcFS.mu.RLock()
-				for p, node := range srcFS.nodes {
-					if strings.HasPrefix(p, skipPrefix) {
-						rel, _ := filepath.Rel(srcPath, p)
-						childDest := filepath.Join(finalDest, rel)
-						simFS.Add(childDest, node.Clone(childDest))
-					}
-				}
-				srcFS.mu.RUnlock()
+				skipPrefix = filepath.Clean(srcPath) + string(filepath.Separator)
 			}
 		}
 	}
 
-	return ops, simFS, nil
+	close(jobChan)
+	wg.Wait()
+	close(errChan)
+
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
+		if p.cli.Verbose > 1 {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("encountered %d errors during phase", len(errs))
+	}
+
+	// destFS is passed as pointer, but we made a new simFS. We need to sync back.
+	destFS.mu.Lock()
+	destFS.checked = simFS.checked
+	destFS.nodes = simFS.nodes
+	destFS.mu.Unlock()
+
+	return nil
 }
 
 func (p *Program) executeOperation(op MergeOperation) error {
@@ -996,25 +1049,19 @@ func (p *Program) executeOperation(op MergeOperation) error {
 	}
 
 	if p.cli.Verbose > 0 {
-		action := op.Action
-		if op.DeleteDest {
-			action = "replace"
-		}
-		fmt.Printf("%s: %s -> %s\n", action, op.SrcPath, finalDest)
+		p.logOp(op)
 	}
 
 	if p.cli.Simulate {
 		return nil
 	}
 
-	// Delete destination if needed
 	if op.DeleteDest {
 		if err := os.RemoveAll(op.DestPath); err != nil {
 			return fmt.Errorf("delete dest: %w", err)
 		}
 	}
 
-	// Delete source if needed
 	if op.DeleteSrc {
 		if err := os.RemoveAll(op.SrcPath); err != nil {
 			return fmt.Errorf("delete src: %w", err)
@@ -1022,12 +1069,10 @@ func (p *Program) executeOperation(op MergeOperation) error {
 		return nil
 	}
 
-	// Skip operation
 	if op.Action == "skip" {
 		return nil
 	}
 
-	// Create parent directory
 	if err := os.MkdirAll(filepath.Dir(finalDest), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
@@ -1130,23 +1175,12 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 	}
 
 	// Handle Regular File
-	src, err := os.Open(srcPath)
-	if err != nil {
+	if err := copyFile(srcPath, dstPath); err != nil {
 		return err
 	}
-	defer src.Close()
 
-	dst, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-
-	n, err := io.Copy(dst, src)
-	if err != nil {
-		return err
-	}
-	atomic.AddInt64(&p.stats.BytesMoved, n)
+	size, _ := node.GetSize()
+	atomic.AddInt64(&p.stats.BytesMoved, size)
 	atomic.AddInt64(&p.stats.FilesProcessed, 1)
 
 	if isMove {
@@ -1155,94 +1189,22 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 	return nil
 }
 
-func isInside(path, parent string) bool {
-	absPath, err1 := filepath.Abs(path)
-	absParent, err2 := filepath.Abs(parent)
-	if err1 != nil || err2 != nil {
-		return strings.HasPrefix(filepath.Clean(path), filepath.Clean(parent)+string(filepath.Separator))
-	}
-	return strings.HasPrefix(filepath.Clean(absPath), filepath.Clean(absParent)+string(filepath.Separator))
-}
-
-func (p *Program) executeOperations(ops []MergeOperation) error {
-	// Plan: Renames of existing files must happen before moves into their places.
-	// Since rename-dest operations move something FROM the destination,
-	// we execute them in the first phase.
-	var phase1 []MergeOperation // Renames/Preparations
-	var phase2 []MergeOperation // Moves/Copies
-
-	absDest, _ := filepath.Abs(p.cli.Destination)
-
-	for _, op := range ops {
-		// If the source is already in the destination folder, it's likely a rename-dest
-		if isInside(op.SrcPath, absDest) {
-			phase1 = append(phase1, op)
-		} else {
-			phase2 = append(phase2, op)
-		}
-	}
-
-	if err := p.runOperationPhase(phase1); err != nil {
+func copyFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	return p.runOperationPhase(phase2)
-}
 
-func (p *Program) runOperationPhase(ops []MergeOperation) error {
-	if len(ops) == 0 {
-		return nil
-	}
+	cmd := exec.Command(
+		"cp",
+		"--sparse=auto",
+		"-p",
+		src,
+		dst,
+	)
 
-	numWorkers := p.cli.Workers
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
-
-	opChanSize := len(ops)
-	if opChanSize > 4096 {
-		opChanSize = 4096
-	}
-	opChan := make(chan MergeOperation, opChanSize)
-	errChan := make(chan error, 128) // Small buffer for errors
-	var wg sync.WaitGroup
-
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for op := range opChan {
-				if err := p.executeOperation(op); err != nil {
-					atomic.AddInt64(&p.stats.Errors, 1)
-					select {
-					case errChan <- fmt.Errorf("%s: %w", op.SrcPath, err):
-					default:
-						// Buffer full, drop or print
-						if p.cli.Verbose > 1 {
-							fmt.Fprintf(os.Stderr, "Error (buffer full): %s: %v\n", op.SrcPath, err)
-						}
-					}
-				}
-			}
-		}()
-	}
-
-	for _, op := range ops {
-		opChan <- op
-	}
-	close(opChan)
-	wg.Wait()
-	close(errChan)
-
-	var errs []error
-	for err := range errChan {
-		errs = append(errs, err)
-		if p.cli.Verbose > 1 {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("encountered %d errors during phase", len(errs))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		_ = os.Remove(dst)
+		return fmt.Errorf("cp failed: %s", bytes.TrimSpace(out))
 	}
 	return nil
 }
@@ -1286,26 +1248,31 @@ func (p *Program) shouldInclude(path string) bool {
 	return true
 }
 
-func removeEmptyDirs(path string) error {
-	entries, err := os.ReadDir(path)
+func removeEmptyDirs(root string) error {
+	var dirs []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			if err := removeEmptyDirs(filepath.Join(path, entry.Name())); err != nil {
-				return err
-			}
+
+	for i := len(dirs) - 1; i >= 0; i-- {
+		entries, err := os.ReadDir(dirs[i])
+		if err != nil {
+			continue
+		}
+		if len(entries) == 0 {
+			_ = os.Remove(dirs[i])
 		}
 	}
-	// Re-read entries
-	entries, err = os.ReadDir(path)
-	if err != nil {
-		return err
-	}
-	if len(entries) == 0 {
-		return os.Remove(path)
-	}
+
 	return nil
 }
 
@@ -1313,7 +1280,7 @@ func main() {
 	cli := &CLI{}
 	ctx := kong.Parse(cli,
 		kong.Name("merge"),
-		kong.Description("Merge folders with sophisticated conflict resolution"),
+		kong.Description("Merge folders with apriori conflict resolution"),
 		kong.UsageOnError(),
 	)
 
@@ -1338,28 +1305,11 @@ func main() {
 	// Process each source
 	for _, src := range cli.Sources {
 		srcFS := NewFileSystem()
-		srcPaths, err := scanDirectory(src, srcFS)
+		// Stream parallel processing
+		err := p.processSource(src, srcFS, destFS)
 		if err != nil {
-			ctx.Fatalf("Error scanning source %s: %v", src, err)
+			ctx.Fatalf("Error processing source %s: %v", src, err)
 		}
-
-		ops, simFS, err := p.planMerge(src, srcFS, srcPaths, destFS)
-		if err != nil {
-			ctx.Fatalf("Error planning merge: %v", err)
-		}
-
-		if cli.Verbose > 0 {
-			fmt.Printf("Source: %s\n", src)
-			fmt.Printf("  Operations: %d\n", len(ops))
-			fmt.Printf("  Conflicts: %d\n", p.stats.Conflicts)
-		}
-
-		if err := p.executeOperations(ops); err != nil {
-			ctx.Fatalf("Error executing operations: %v", err)
-		}
-
-		// Update destFS with simFS for next source
-		destFS = simFS
 
 		// Clean up empty directories
 		if !cli.Copy && !cli.Simulate {
@@ -1370,4 +1320,25 @@ func main() {
 	if cli.Verbose > 0 {
 		p.stats.Print()
 	}
+}
+
+func (p *Program) logOp(op MergeOperation) {
+	finalDest := op.DestPath
+	if op.RenamedDestPath != "" {
+		finalDest = op.RenamedDestPath
+	}
+
+	rel := finalDest
+	if p.destRoot != "" {
+		if r, err := filepath.Rel(p.destRoot, finalDest); err == nil {
+			rel = r
+		}
+	}
+
+	action := op.Action
+	if op.DeleteDest {
+		action = "replace"
+	}
+
+	fmt.Fprintf(os.Stderr, "%-10s %s\n", action, rel)
 }

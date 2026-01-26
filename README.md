@@ -53,10 +53,10 @@ When a file conflicts with a folder:
 
 - `skip` - Keep folder, skip file
 - `rename-src` - Rename file to name_1
-- `rename-dest` - Rename folder to name_1/, place file
+- `rename-dest` - Rename folder to name_1/, move file
 - `delete-src` - Delete file
 - `delete-dest` - Delete folder tree
-- `merge` - Move file into folder as folder/folder
+- `merge` - Move file into folder as folder/file
 
 Default: "merge"
 
@@ -65,7 +65,8 @@ Default: "merge"
 When a folder conflicts with a file:
 
 - `skip` - Keep file, skip folder
-- `rename-dest` - Rename file, place folder
+- `rename-src` - Rename folder to name_1/
+- `rename-dest` - Rename file, move folder
 - `delete-src` - Delete folder tree
 - `delete-dest` - Delete file
 - `merge` - Move file into folder as folder/file
