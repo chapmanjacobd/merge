@@ -1025,6 +1025,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 				if destNode, ok := destFS.Get(p.cli.Destination); ok && destNode.IsDir {
 					destExistsAsDir = true
 				} else {
+					// Fallback to direct stat if not cached
 					if info, err := os.Stat(p.cli.Destination); err == nil && info.IsDir() {
 						destExistsAsDir = true
 					}
@@ -1039,8 +1040,13 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 						appendBasename = false
 					} else {
 						existsAsFile := false
-						if info, err := os.Stat(p.cli.Destination); err == nil && !info.IsDir() {
+						if destNode, ok := destFS.Get(p.cli.Destination); ok && !destNode.IsDir {
 							existsAsFile = true
+						} else {
+							// Fallback to direct stat
+							if info, err := os.Stat(p.cli.Destination); err == nil && !info.IsDir() {
+								existsAsFile = true
+							}
 						}
 						if existsAsFile {
 							appendBasename = false
@@ -1083,7 +1089,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 		srcNode, _ := srcFS.Get(srcPath)
 
 		if !srcNode.IsDir {
-			if !p.shouldInclude(srcPath) {
+			if !p.shouldInclude(srcPath, srcNode) {
 				continue
 			}
 		}
@@ -1402,7 +1408,7 @@ func copyFile(src, dst string) error {
 	return nil
 }
 
-func (p *Program) shouldInclude(path string) bool {
+func (p *Program) shouldInclude(path string, node *FileNode) bool {
 	name := filepath.Base(path)
 	if len(p.cli.Ext) > 0 {
 		match := false
@@ -1438,13 +1444,13 @@ func (p *Program) shouldInclude(path string) bool {
 		}
 	}
 
-	// Check size constraints
+	// Check size constraints using cached GetInfo
 	if len(p.cli.Size) > 0 {
-		info, err := os.Stat(path)
+		size, err := node.GetSize()
 		if err != nil {
 			return false
 		}
-		if !p.sizeFilter(info.Size()) {
+		if !p.sizeFilter(size) {
 			return false
 		}
 	}
@@ -1482,7 +1488,7 @@ func removeEmptyDirs(root string) error {
 
 func main() {
 	cli := &CLI{}
-	ctx := kong.Parse(cli,
+	kong.Parse(cli,
 		kong.Name("merge"),
 		kong.Description("Merge folders with apriori conflict resolution"),
 		kong.UsageOnError(),
@@ -1490,29 +1496,22 @@ func main() {
 
 	p := NewProgram(cli)
 
-	// Scan destination
+	// Scan destination, add it to destFS so conflicts are detected
 	destFS := NewFileSystem()
-	if info, err := os.Stat(cli.Destination); err == nil {
-		if info.IsDir() {
-			// It's a directory, we do not scan it. Lazy loading will handle conflict checks.
-		} else {
-			// It's a file, add it to destFS so conflicts are detected
-			destFS.Add(cli.Destination, &FileNode{
-				Path:       cli.Destination,
-				IsDir:      false,
-				info:       info,
-				infoLoaded: true,
-			})
-		}
-	}
+	destFS.GetOrLoad(cli.Destination)
 
 	// Process each source
 	for _, src := range cli.Sources {
+		if _, err := os.Stat(src); err != nil {
+			fmt.Fprintf(os.Stderr, "Source %s does not exist", src)
+			continue
+		}
+
 		srcFS := NewFileSystem()
 		// Stream parallel processing
 		err := p.processSource(src, srcFS, destFS)
 		if err != nil {
-			ctx.Fatalf("Error processing source %s: %v", src, err)
+			fmt.Fprintf(os.Stderr, "Error processing source %s: %v", src, err)
 		}
 
 		// Clean up empty directories
