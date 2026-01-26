@@ -235,15 +235,15 @@ type CLI struct {
 	FolderOverFile string `help:"Folder over file strategy" default:"merge"`
 
 	Copy     bool `help:"Copy instead of move" short:"c"`
-	Simulate bool `help:"Simulate without making changes" alias:"dry-run" short:"n"`
-	Workers  int  `help:"Number of parallel workers" default:"4" alias:"threads" short:"j"`
+	Simulate bool `help:"Simulate without making changes" aliases:"dry-run" short:"n"`
+	Workers  int  `help:"Number of parallel workers" default:"4" aliases:"threads" short:"j"`
 	Verbose  int  `help:"Verbose output (0-2)" short:"v" type:"counter"`
 
 	Ext       []string `help:"Filter by file extensions" short:"e"`
 	Exclude   []string `help:"Exclude patterns" short:"E"`
 	Include   []string `help:"Include patterns" short:"I"`
 	Limit     int      `help:"Limit number of files transferred" short:"l"`
-	SizeLimit string   `help:"Limit total size of files transferred (e.g., 100M, 1G)" short:"sl"`
+	SizeLimit string   `help:"Limit total size of files transferred (e.g., 100M, 1G)" aliases:"sl"`
 
 	RelativeTo string `help:"Preserve directory hierarchy relative to path"`
 	Relative   bool   `help:"Shortcut for --relative-to=/"`
@@ -252,8 +252,8 @@ type CLI struct {
 	BSD    bool `help:"rsync/BSD mv behavior (src trailing slash matters)"`
 
 	DestBSD    bool `help:"BSD destination mode (default)"`
-	DestFolder bool `help:"Destination is always a folder" alias:"folder" short:"t"`
-	DestFile   bool `help:"Destination is a file (no-target-directory)" alias:"file" short:"T"`
+	DestFolder bool `help:"Destination is always a folder" aliases:"folder" short:"t"`
+	DestFile   bool `help:"Destination is a file (no-target-directory)" aliases:"file" short:"T"`
 }
 
 func (c *CLI) AfterApply() error {

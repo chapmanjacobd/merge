@@ -2,6 +2,10 @@
 
 A high-performance Go implementation for merging folders with preconfigured conflict resolution.
 
+## Install
+
+    go install github.com/chapmanjacobd/merge@latest
+
 ## Features
 
 ### Core Capabilities
