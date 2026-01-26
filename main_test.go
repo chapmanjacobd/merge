@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -1373,5 +1374,140 @@ func TestSymlinks(t *testing.T) {
 	}
 	if gotTarget != targetFile {
 		t.Errorf("Expected link target %q, got %q", targetFile, gotTarget)
+	}
+}
+
+func TestMultipleSourcesRace(t *testing.T) {
+	// This test simulates a race condition where dependent operations are scheduled
+	// (e.g. rename A -> B, then rename B -> C) and dispatched to different workers.
+	// We use "rename-dest" strategy to force renames.
+	// src1: populates dest with "file_i"
+	// src2: contains "file_i" (causes rename dest/file_i -> dest/file_i_1)
+	// src2: ALSO contains "file_i_1" (causes rename dest/file_i_1 -> dest/file_i_2)
+	// If the second rename happens before the first rename is complete, it will fail.
+
+	tmpDir := t.TempDir()
+	src1 := filepath.Join(tmpDir, "src1")
+	src2 := filepath.Join(tmpDir, "src2")
+	dest := filepath.Join(tmpDir, "dest")
+
+	os.MkdirAll(src1, 0o755)
+	os.MkdirAll(src2, 0o755)
+	os.MkdirAll(dest, 0o755)
+
+	numFiles := 50 // Enough to likely trigger race with parallel workers
+
+	// Setup src1
+	for i := 0; i < numFiles; i++ {
+		fname := fmt.Sprintf("file_%d", i)
+		if err := os.WriteFile(filepath.Join(src1, fname), []byte("src1"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Setup src2
+	for i := 0; i < numFiles; i++ {
+		// file_i: will conflict with dest/file_i (from src1), causing dest/file_i -> dest/file_i_1
+		fname := fmt.Sprintf("file_%d", i)
+		if err := os.WriteFile(filepath.Join(src2, fname), []byte("src2_main"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		// file_i_1: will conflict with dest/file_i_1 (created by above rename), causing dest/file_i_1 -> dest/file_i_2
+		fnamesub := fmt.Sprintf("file_%d_1", i)
+		if err := os.WriteFile(filepath.Join(src2, fnamesub), []byte("src2_sub"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Use rename-dest to trigger the dependency chain
+	cli := &CLI{
+		Sources:        []string{src1, src2},
+		Destination:    dest,
+		FileOverFile:   "rename-dest",
+		FileOverFolder: "merge",
+		FolderOverFile: "merge",
+		Workers:        10, // Parallelism is key here
+	}
+
+	p := NewProgram(cli)
+	destFS := NewFileSystem()
+
+	// Run src1
+	if err := p.processSource(src1, NewFileSystem(), destFS); err != nil {
+		t.Fatalf("src1 processing failed: %v", err)
+	}
+
+	// Run src2 - this is where the race condition would occur
+	if err := p.processSource(src2, NewFileSystem(), destFS); err != nil {
+		t.Fatalf("src2 processing failed (race condition triggered?): %v", err)
+	}
+
+	// Validation
+	count := 0
+	filepath.Walk(dest, func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			count++
+		}
+		return nil
+	})
+
+	// Expected files per 'i':
+	// dest/file_i (content: src2_main)
+	// dest/file_i_1 (content: src2_sub)
+	// dest/file_i_2 (content: src1 - originally file_i, renamed to _1, then to _2)
+	expected := numFiles * 3
+	if count != expected {
+		t.Errorf("Expected %d files, got %d", expected, count)
+	}
+}
+
+func TestConcurrentSourcesDestFSAccess(t *testing.T) {
+	// This test attempts to simulate concurrent access to the shared destFS
+	// by running processSource in parallel, which is not the standard flow
+	// but tests robustness of the FileSystem locking.
+
+	tmpDir := t.TempDir()
+	src1 := filepath.Join(tmpDir, "src1")
+	src2 := filepath.Join(tmpDir, "src2")
+	dest := filepath.Join(tmpDir, "dest")
+
+	os.MkdirAll(src1, 0o755)
+	os.MkdirAll(src2, 0o755)
+	os.MkdirAll(dest, 0o755)
+
+	os.WriteFile(filepath.Join(src1, "file1.txt"), []byte("src1"), 0o644)
+	os.WriteFile(filepath.Join(src2, "file2.txt"), []byte("src2"), 0o644)
+
+	cli := &CLI{
+		Destination:  dest,
+		FileOverFile: "skip",
+		Workers:      2,
+	}
+
+	p := NewProgram(cli)
+	destFS := NewFileSystem()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Random start delay to interleave operations
+	go func() {
+		defer wg.Done()
+		p.processSource(src1, NewFileSystem(), destFS)
+	}()
+	go func() {
+		defer wg.Done()
+		p.processSource(src2, NewFileSystem(), destFS)
+	}()
+
+	wg.Wait()
+
+	// Check if both files exist (basic smoke test for crash/panic)
+	if _, err := os.Stat(filepath.Join(dest, "file1.txt")); os.IsNotExist(err) {
+		t.Error("file1.txt missing")
+	}
+	if _, err := os.Stat(filepath.Join(dest, "file2.txt")); os.IsNotExist(err) {
+		t.Error("file2.txt missing")
 	}
 }

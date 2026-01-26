@@ -310,7 +310,8 @@ func (c *CLI) AfterApply() error {
 }
 
 type MergeJob struct {
-	Ops []MergeOperation
+	Ops  []MergeOperation
+	Root string
 }
 
 type Stats struct {
@@ -360,7 +361,6 @@ type Progress struct {
 type Program struct {
 	cli        *CLI
 	stats      Stats
-	destRoot   string
 	progress   Progress
 	sigChan    chan os.Signal
 	sizeFilter func(int64) bool
@@ -381,17 +381,6 @@ func NewProgram(cli *CLI) *Program {
 	}
 
 	return p
-}
-
-func (p *Program) watchResize() {
-	p.updateWidth()
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGWINCH)
-	go func() {
-		for range ch {
-			p.updateWidth()
-		}
-	}()
 }
 
 func (p *Program) updateWidth() {
@@ -948,7 +937,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 			defer wg.Done()
 			for job := range jobChan {
 				for _, op := range job.Ops {
-					if err := p.executeOperation(op); err != nil {
+					if err := p.executeOperation(op, job.Root); err != nil {
 						atomic.AddInt64(&p.stats.Errors, 1)
 						select {
 						case errChan <- fmt.Errorf("%s: %w", op.SrcPath, err):
@@ -1061,7 +1050,6 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 			}
 		}
 	}
-	p.destRoot = destRoot
 
 	// Capture initial stats before processing this source
 	initialFiles := atomic.LoadInt64(&p.stats.FilesProcessed)
@@ -1194,7 +1182,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 			jobOps = append(jobOps, op)
 
 			// Send job
-			jobChan <- MergeJob{Ops: jobOps}
+			jobChan <- MergeJob{Ops: jobOps, Root: destRoot}
 
 			if !op.IsDir {
 				sz, _ := srcNode.GetSize()
@@ -1241,14 +1229,14 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	return nil
 }
 
-func (p *Program) executeOperation(op MergeOperation) error {
+func (p *Program) executeOperation(op MergeOperation, root string) error {
 	finalDest := op.DestPath
 	if op.RenamedDestPath != "" {
 		finalDest = op.RenamedDestPath
 	}
 
 	if p.cli.Verbose > 0 {
-		p.logOp(op)
+		p.logOp(op, root)
 	}
 
 	if p.cli.Simulate {
@@ -1525,15 +1513,15 @@ func main() {
 	}
 }
 
-func (p *Program) logOp(op MergeOperation) {
+func (p *Program) logOp(op MergeOperation, root string) {
 	finalDest := op.DestPath
 	if op.RenamedDestPath != "" {
 		finalDest = op.RenamedDestPath
 	}
 
 	rel := finalDest
-	if p.destRoot != "" {
-		if r, err := filepath.Rel(p.destRoot, finalDest); err == nil {
+	if root != "" {
+		if r, err := filepath.Rel(root, finalDest); err == nil {
 			rel = r
 		}
 	}
