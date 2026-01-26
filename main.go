@@ -9,14 +9,18 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/alecthomas/kong"
+	"golang.org/x/term"
 )
 
 type FileOverFileOpt string
@@ -239,6 +243,7 @@ type CLI struct {
 	Ext       []string `help:"Filter by file extensions" short:"e"`
 	Exclude   []string `help:"Exclude patterns" short:"E"`
 	Include   []string `help:"Include patterns" short:"I"`
+	Size      []string `help:"Filter by file size (fd-find syntax: -S+5M, -S-10M, -S5M%10)" short:"S" aliases:"sizes"`
 	Limit     int      `help:"Limit number of files transferred" short:"l"`
 	SizeLimit string   `help:"Limit total size of files transferred (e.g., 100M, 1G)" aliases:"sl"`
 
@@ -344,14 +349,191 @@ func (s *Stats) Print() {
 	}
 }
 
+type Progress struct {
+	start         time.Time
+	lastPrintTime time.Time
+	currentRel    atomic.Value // string
+	termWidth     int
+	mu            sync.Mutex
+}
+
 type Program struct {
-	cli      *CLI
-	stats    Stats
-	destRoot string
+	cli        *CLI
+	stats      Stats
+	destRoot   string
+	progress   Progress
+	sigChan    chan os.Signal
+	sizeFilter func(int64) bool
 }
 
 func NewProgram(cli *CLI) *Program {
-	return &Program{cli: cli}
+	p := &Program{
+		cli:        cli,
+		sigChan:    make(chan os.Signal, 1),
+		sizeFilter: parseSizeFilter(cli.Size),
+	}
+	p.progress.start = time.Now()
+	p.progress.lastPrintTime = time.Now()
+
+	if cli.Verbose > 0 {
+		signal.Notify(p.sigChan, os.Interrupt, syscall.SIGTERM)
+		p.watchResize()
+	}
+
+	return p
+}
+
+func (p *Program) watchResize() {
+	p.updateWidth()
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGWINCH)
+	go func() {
+		for range ch {
+			p.updateWidth()
+		}
+	}()
+}
+
+func (p *Program) updateWidth() {
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		p.progress.termWidth = 80
+		return
+	}
+	p.progress.mu.Lock()
+	p.progress.termWidth = w
+	p.progress.mu.Unlock()
+}
+
+func (p *Program) printProgress() {
+	if p.cli.Verbose == 0 {
+		return
+	}
+
+	files := atomic.LoadInt64(&p.stats.FilesProcessed)
+	bytes := atomic.LoadInt64(&p.stats.BytesMoved)
+	elapsed := time.Since(p.progress.start).Seconds()
+
+	var rate float64
+	if elapsed > 0 {
+		rate = float64(bytes) / elapsed
+	}
+
+	status := fmt.Sprintf(
+		"[Files: %d, %s] | %s/s",
+		files,
+		bytes2human(bytes),
+		bytes2human(int64(rate)),
+	)
+
+	cur, _ := p.progress.currentRel.Load().(string)
+	p.progress.mu.Lock()
+	termWidth := p.progress.termWidth
+	p.progress.mu.Unlock()
+
+	remaining := termWidth - len(status) - 4
+	if remaining > 10 && cur != "" {
+		status += " | " + truncateMiddle(cur, remaining)
+	}
+
+	fmt.Fprint(os.Stderr, "\r"+status+"\033[K")
+	p.progress.lastPrintTime = time.Now()
+}
+
+func bytes2human(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for n >= unit*div && exp < 5 {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func parseSizeFilter(sizes []string) func(int64) bool {
+	if len(sizes) == 0 {
+		return func(int64) bool { return true }
+	}
+
+	return func(size int64) bool {
+		for _, constraint := range sizes {
+			if !checkSizeConstraint(size, constraint) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func checkSizeConstraint(size int64, constraint string) bool {
+	constraint = strings.TrimSpace(constraint)
+	if constraint == "" {
+		return true
+	}
+
+	// Handle percentage constraints (e.g., "5M%10" means 5MB ±10%)
+	if strings.Contains(constraint, "%") {
+		parts := strings.Split(constraint, "%")
+		if len(parts) != 2 {
+			return true // Invalid format, skip
+		}
+		targetSize := humanToBytes(parts[0])
+		percent, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return true // Invalid percent, skip
+		}
+		lowerBound := int64(float64(targetSize) * (1 - percent/100))
+		upperBound := int64(float64(targetSize) * (1 + percent/100))
+		return size >= lowerBound && size <= upperBound
+	}
+
+	// Handle comparison operators
+	if strings.HasPrefix(constraint, ">") {
+		threshold := humanToBytes(strings.TrimPrefix(constraint, ">"))
+		return size > threshold
+	}
+	if strings.HasPrefix(constraint, "<") {
+		threshold := humanToBytes(strings.TrimPrefix(constraint, "<"))
+		return size < threshold
+	}
+	if strings.HasPrefix(constraint, "+") {
+		threshold := humanToBytes(strings.TrimPrefix(constraint, "+"))
+		return size > threshold
+	}
+	if strings.HasPrefix(constraint, "-") {
+		threshold := humanToBytes(strings.TrimPrefix(constraint, "-"))
+		return size <= threshold
+	}
+
+	// Exact match
+	threshold := humanToBytes(constraint)
+	return size == threshold
+}
+
+func truncateMiddle(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max < 3 {
+		return s[:max]
+	}
+	half := (max - 1) / 2
+	return s[:half] + "…" + s[len(s)-half:]
+}
+
+func (p *Program) updateCurrentFile(relPath string) {
+	if p.cli.Verbose > 0 {
+		p.progress.currentRel.Store(relPath)
+
+		// Print progress every 200ms to avoid excessive updates
+		now := time.Now()
+		if now.Sub(p.progress.lastPrintTime) > 200*time.Millisecond {
+			p.printProgress()
+		}
+	}
 }
 
 // sampleHash computes a hash from samples across the file for quick comparison.
@@ -772,11 +954,11 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 						case errChan <- fmt.Errorf("%s: %w", op.SrcPath, err):
 						default:
 							if p.cli.Verbose > 1 {
-								fmt.Fprintf(os.Stderr, "Error (buffer full): %s: %v\n", op.SrcPath, err)
+								fmt.Fprintf(os.Stderr, "\nError (buffer full): %s: %v\n", op.SrcPath, err)
 							}
 						}
 
-						fmt.Fprintf(os.Stderr, "Error in job: skipping remaining ops:\n")
+						fmt.Fprintf(os.Stderr, "\nError in job: skipping remaining ops:\n")
 						for _, op := range job.Ops {
 							fmt.Fprintf(os.Stderr, "  %v: %s\n", op.Action, op.SrcPath)
 						}
@@ -926,6 +1108,11 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 			destPath = filepath.Join(destRoot, relPath)
 		}
 
+		// Update progress with current file
+		if p.cli.Verbose > 0 && !srcNode.IsDir {
+			p.updateCurrentFile(relPath)
+		}
+
 		op := MergeOperation{
 			SrcPath:  srcPath,
 			DestPath: destPath,
@@ -936,7 +1123,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 
 		var jobOps []MergeOperation
 
-		hasFilters := len(p.cli.Ext) > 0 || len(p.cli.Include) > 0 || len(p.cli.Exclude) > 0 || p.cli.Limit > 0 || maxBytes > 0
+		hasFilters := len(p.cli.Ext) > 0 || len(p.cli.Include) > 0 || len(p.cli.Exclude) > 0 || len(p.cli.Size) > 0 || p.cli.Limit > 0 || maxBytes > 0
 
 		destNode, exists := simFS.GetOrLoad(destPath)
 		if !exists && srcNode.IsDir && (hasFilters || p.cli.Limit > 0 || maxBytes > 0) {
@@ -1019,12 +1206,18 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 
 	close(jobChan)
 	wg.Wait()
+
+	// Clear progress line if verbose
+	if p.cli.Verbose > 0 {
+		fmt.Fprint(os.Stderr, "\r\033[K")
+	}
+
 	close(errChan)
 
 	var errs []error
 	for err := range errChan {
 		errs = append(errs, err)
-		if p.cli.Verbose > 1 {
+		if p.cli.Verbose > 0 {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 	}
@@ -1245,6 +1438,17 @@ func (p *Program) shouldInclude(path string) bool {
 		}
 	}
 
+	// Check size constraints
+	if len(p.cli.Size) > 0 {
+		info, err := os.Stat(path)
+		if err != nil {
+			return false
+		}
+		if !p.sizeFilter(info.Size()) {
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -1340,5 +1544,5 @@ func (p *Program) logOp(op MergeOperation) {
 		action = "replace"
 	}
 
-	fmt.Fprintf(os.Stderr, "%-10s %s\n", action, rel)
+	fmt.Fprintf(os.Stderr, "\n%-10s %s", action, rel)
 }
