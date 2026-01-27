@@ -111,7 +111,6 @@ func TestSimpleMove(t *testing.T) {
 	}
 
 	srcFS := NewFileSystem()
-	// srcPaths, _ := scanDirectory(src, srcFS) // Removed
 	destFS := NewFileSystem()
 
 	p := NewProgram(cli)
@@ -791,10 +790,6 @@ func TestEmptyFileOverwrite(t *testing.T) {
 	want := testTree{"file.txt": "content"}
 	compareTrees(t, "dest", got, want)
 }
-
-// TestParallelRace removed as it relied on internal planning structures
-// specific to the old architecture and is adequately covered by other tests
-// running with high worker counts.
 
 func TestFilters(t *testing.T) {
 	tmpDir := t.TempDir()

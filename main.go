@@ -2,14 +2,12 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -1192,8 +1190,10 @@ loop:
 			atomic.AddInt64(&p.stats.Conflicts, 1)
 
 			if srcNode.IsDir && destNode.IsDir {
+				// Folder over folder
 				op.Action = "merge"
 			} else if !srcNode.IsDir && !destNode.IsDir {
+				// File over file
 				op.Action = "transfer"
 				p.clobberFileOverFile(&op, srcNode, destNode, destPath, fileStrategy, simFS, &jobOps)
 				if op.DeleteDest {
@@ -1207,6 +1207,7 @@ loop:
 					simFS.Add(finalPath, srcNode.Clone(finalPath))
 				}
 			} else if !srcNode.IsDir && destNode.IsDir {
+				// File over folder
 				op.Action = "transfer"
 				mode := ConflictMode(p.cli.FileOverFolder)
 				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &jobOps)
@@ -1221,6 +1222,7 @@ loop:
 					simFS.Add(finalPath, srcNode.Clone(finalPath))
 				}
 			} else {
+				// Folder over file
 				op.Action = "transfer"
 				mode := ConflictMode(p.cli.FolderOverFile)
 				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &jobOps)
@@ -1435,26 +1437,6 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 
 	if isMove {
 		return os.Remove(srcPath)
-	}
-	return nil
-}
-
-func copyFile(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-
-	cmd := exec.Command(
-		"cp",
-		"--sparse=auto",
-		"-p",
-		src,
-		dst,
-	)
-
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(dst)
-		return fmt.Errorf("cp failed: %s", bytes.TrimSpace(out))
 	}
 	return nil
 }
