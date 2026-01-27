@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -256,6 +257,8 @@ type CLI struct {
 	DestBSD    bool `help:"BSD destination mode (default)"`
 	DestFolder bool `help:"Destination is always a folder" aliases:"folder" short:"t"`
 	DestFile   bool `help:"Destination is a file (no-target-directory)" aliases:"file" short:"T"`
+
+	Resume string `help:"Text file containing relative paths to process" short:"r" placeholder:"FILE"`
 }
 
 func (c *CLI) AfterApply() error {
@@ -375,10 +378,8 @@ func NewProgram(cli *CLI) *Program {
 	p.progress.start = time.Now()
 	p.progress.lastPrintTime = time.Now()
 
-	if cli.Verbose > 0 {
-		signal.Notify(p.sigChan, os.Interrupt, syscall.SIGTERM)
-		p.watchResize()
-	}
+	signal.Notify(p.sigChan, os.Interrupt, syscall.SIGTERM)
+	p.watchResize()
 
 	return p
 }
@@ -694,6 +695,29 @@ func (p *Program) compareFiles(src, dst *FileNode) (bool, error) {
 
 func (p *Program) streamScan(root string, fs *FileSystem) <-chan string {
 	out := make(chan string, 1024)
+
+	if p.cli.Resume != "" {
+		if _, err := os.Stat(p.cli.Resume); err == nil {
+			go func() {
+				defer close(out)
+				f, err := os.Open(p.cli.Resume)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error opening resume file: %v\n", err)
+					return
+				}
+				defer f.Close()
+
+				scanner := bufio.NewScanner(f)
+				for scanner.Scan() {
+					rel := scanner.Text()
+					path := filepath.Join(root, rel)
+					out <- path
+				}
+			}()
+			return out
+		}
+	}
+
 	go func() {
 		defer close(out)
 		filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -720,6 +744,29 @@ func (p *Program) streamScan(root string, fs *FileSystem) <-chan string {
 		})
 	}()
 	return out
+}
+
+func (p *Program) saveRemaining(srcRoot string, paths <-chan string) {
+	name := p.cli.Resume
+	if name == "" {
+		name = filepath.Base(srcRoot) + ".remainingfiles"
+	}
+	f, err := os.Create(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write remaining file: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	for path := range paths {
+		rel, err := filepath.Rel(srcRoot, path)
+		if err == nil {
+			fmt.Fprintln(f, rel)
+		} else {
+			fmt.Fprintln(f, path)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "\nRemaining paths saved to: %s\n", name)
 }
 
 func getUniqueFilename(basePath string, fs *FileSystem) string {
@@ -1057,7 +1104,23 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	initialBytes := atomic.LoadInt64(&p.stats.BytesMoved)
 
 	var scheduledFiles, scheduledFolders, scheduledBytes int64
-	for srcPath := range pathChan {
+loop:
+	for {
+		var srcPath string
+		var ok bool
+		select {
+		case <-p.sigChan:
+			if p.cli.Resume != "" {
+				fmt.Fprintf(os.Stderr, "\nInterrupt received. Saving remaining files...\n")
+				p.saveRemaining(srcRoot, pathChan)
+			}
+			os.Exit(130)
+		case srcPath, ok = <-pathChan:
+			if !ok {
+				break loop
+			}
+		}
+
 		currentCount := int(initialFiles + initialFolders + scheduledFiles + scheduledFolders)
 		currentBytes := initialBytes + scheduledBytes
 
@@ -1074,7 +1137,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 			}
 		}
 
-		srcNode, _ := srcFS.Get(srcPath)
+		srcNode, _ := srcFS.GetOrLoad(srcPath)
 
 		if !srcNode.IsDir {
 			if !p.shouldInclude(srcPath, srcNode) {
