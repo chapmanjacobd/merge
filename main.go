@@ -28,7 +28,7 @@ type MergeOperation struct {
 	DestPath        string
 	RenamedDestPath string
 	IsDir           bool
-	Action          string // "skip", "delete-dest", "rename-src", "rename-dest", "transfer", "rename", "merge"
+	Copy            bool
 	DeleteDest      bool
 	DeleteSrc       bool
 	SrcNode         *FileNode
@@ -107,6 +107,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	var wg sync.WaitGroup
 
 	// Start workers
+	p.logDebug("Starting %d workers", numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
@@ -118,14 +119,18 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 						select {
 						case errChan <- fmt.Errorf("%s: %w", ShellQuote(op.SrcPath), err):
 						default:
-							if p.cli.Verbose > 1 {
+							if p.cli.Verbose > 0 {
 								fmt.Fprintf(os.Stderr, "\nError (buffer full): %s: %v\n", ShellQuote(op.SrcPath), err)
 							}
 						}
 
 						fmt.Fprintf(os.Stderr, "\nError in job: skipping remaining ops:\n")
 						for _, op := range job.Ops {
-							fmt.Fprintf(os.Stderr, "  %v: %s\n", op.Action, ShellQuote(op.SrcPath))
+							action := "copy"
+							if op.DeleteSrc {
+								action = "move"
+							}
+							fmt.Fprintf(os.Stderr, "  %v: %s\n", action, ShellQuote(op.SrcPath))
 						}
 						break
 					}
@@ -233,7 +238,8 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	initialBytes := atomic.LoadInt64(&p.stats.BytesMoved)
 
 	var scheduledFiles, scheduledFolders, scheduledBytes int64
-loop:
+
+outerloop:
 	for {
 		var srcPath string
 		var ok bool
@@ -246,7 +252,7 @@ loop:
 			os.Exit(130)
 		case srcPath, ok = <-pathChan:
 			if !ok {
-				break loop
+				break outerloop
 			}
 		}
 
@@ -270,6 +276,7 @@ loop:
 
 		if !srcNode.IsDir {
 			if !p.shouldInclude(srcPath, srcNode) {
+				p.logDebug("Skipping %s (filtered out)", ShellQuote(srcPath))
 				continue
 			}
 		}
@@ -306,11 +313,12 @@ loop:
 		}
 
 		op := MergeOperation{
-			SrcPath:  srcPath,
-			DestPath: destPath,
-			IsDir:    srcNode.IsDir,
-			SrcNode:  srcNode,
-			SrcFS:    srcFS,
+			SrcPath:   srcPath,
+			DestPath:  destPath,
+			IsDir:     srcNode.IsDir,
+			SrcNode:   srcNode,
+			SrcFS:     srcFS,
+			DeleteSrc: !p.cli.Copy,
 		}
 
 		var jobOps []MergeOperation
@@ -324,19 +332,17 @@ loop:
 		}
 
 		if exists {
-			atomic.AddInt64(&p.stats.Conflicts, 1)
-
 			if srcNode.IsDir && destNode.IsDir {
-				// Folder over folder
-				op.Action = "merge"
+				// Folder over folder - nothing to do here, will descend
 			} else if !srcNode.IsDir && !destNode.IsDir {
 				// File over file
-				op.Action = "transfer"
+				atomic.AddInt64(&p.stats.FileOverFile, 1)
+				op.Copy = true
 				p.clobberFileOverFile(&op, srcNode, destNode, destPath, fileStrategy, simFS, &jobOps)
 				if op.DeleteDest {
 					simFS.Delete(op.DestPath)
 				}
-				if !op.DeleteSrc && op.Action != "skip" {
+				if !op.DeleteSrc && op.Copy {
 					finalPath := op.DestPath
 					if op.RenamedDestPath != "" {
 						finalPath = op.RenamedDestPath
@@ -345,13 +351,14 @@ loop:
 				}
 			} else if !srcNode.IsDir && destNode.IsDir {
 				// File over folder
-				op.Action = "transfer"
+				atomic.AddInt64(&p.stats.FileOverFolder, 1)
+				op.Copy = true
 				mode := ConflictMode(p.cli.FileOverFolder)
 				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &jobOps)
 				if op.DeleteDest {
 					simFS.Delete(op.DestPath)
 				}
-				if !op.DeleteSrc && op.Action != "skip" {
+				if !op.DeleteSrc && op.Copy {
 					finalPath := op.DestPath
 					if op.RenamedDestPath != "" {
 						finalPath = op.RenamedDestPath
@@ -360,13 +367,14 @@ loop:
 				}
 			} else {
 				// Folder over file
-				op.Action = "transfer"
+				atomic.AddInt64(&p.stats.FolderOverFile, 1)
+				op.Copy = true
 				mode := ConflictMode(p.cli.FolderOverFile)
 				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &jobOps)
 				if op.DeleteDest {
 					simFS.Delete(op.DestPath)
 				}
-				if !op.DeleteSrc && op.Action != "skip" {
+				if !op.DeleteSrc && op.Copy {
 					finalPath := op.DestPath
 					if op.RenamedDestPath != "" {
 						finalPath = op.RenamedDestPath
@@ -374,13 +382,12 @@ loop:
 					simFS.Add(finalPath, srcNode.Clone(finalPath))
 				}
 			}
-
 		} else {
-			op.Action = "transfer"
+			op.Copy = true
 			simFS.Add(destPath, srcNode.Clone(destPath))
 		}
 
-		if op.Action != "merge" && op.Action != "skip" || op.DeleteSrc || op.DeleteDest {
+		if op.Copy || op.DeleteSrc || op.DeleteDest {
 			jobOps = append(jobOps, op)
 
 			// Send job
@@ -394,7 +401,7 @@ loop:
 				scheduledFolders++
 			}
 
-			if (op.Action == "transfer" || op.Action == "rename" || op.DeleteSrc) && op.IsDir {
+			if (op.Copy || op.DeleteSrc) && op.IsDir {
 				skipPrefix = filepath.Clean(srcPath) + string(filepath.Separator)
 			}
 		}
@@ -437,6 +444,12 @@ func (p *Program) executeOperation(op MergeOperation, root string) error {
 		finalDest = op.RenamedDestPath
 	}
 
+	// Fallback to simpler node if missing (e.g. usage in tests or renames)
+	node := op.SrcNode
+	if node == nil {
+		node = &FileNode{Path: op.SrcPath}
+	}
+
 	if p.cli.Verbose > 0 {
 		p.logOp(op, root)
 	}
@@ -451,14 +464,14 @@ func (p *Program) executeOperation(op MergeOperation, root string) error {
 		}
 	}
 
-	if op.DeleteSrc {
+	if op.DeleteSrc && !op.Copy {
 		if err := os.RemoveAll(op.SrcPath); err != nil {
-			return fmt.Errorf("delete src: %w", err)
+			return fmt.Errorf("delete src %s: %w", ShellQuote(op.SrcPath), err)
 		}
 		return nil
 	}
 
-	if op.Action == "skip" {
+	if !op.Copy {
 		return nil
 	}
 
@@ -466,25 +479,11 @@ func (p *Program) executeOperation(op MergeOperation, root string) error {
 		return fmt.Errorf("mkdir: %w", err)
 	}
 
-	isMove := false
-	switch op.Action {
-	case "transfer":
-		isMove = !p.cli.Copy
-	case "rename", "delete-dest":
-		isMove = true
+	if err := p.performTransfer(op.SrcPath, finalDest, node, op.DeleteSrc, op.SrcFS); err != nil {
+		return fmt.Errorf("transfer %s -> %s: %w", ShellQuote(op.SrcPath), ShellQuote(finalDest), err)
 	}
 
-	// Fallback to simpler node if missing (e.g. usage in tests or renames)
-	node := op.SrcNode
-	if node == nil {
-		// Try to find in SrcFS if available, though for rename-dest SrcFS might not be relevant
-		// Just create a temporary node wrapper that will lazy load
-		node = &FileNode{Path: op.SrcPath}
-	}
-
-	if err := p.performTransfer(op.SrcPath, finalDest, node, isMove, op.SrcFS); err != nil {
-		return fmt.Errorf("%s: %w", op.Action, err)
-	}
+	p.logDebug("Completed %s -> %s (deleteSrc=%v)", ShellQuote(op.SrcPath), ShellQuote(finalDest), op.DeleteSrc)
 
 	return nil
 }
@@ -494,6 +493,7 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 	if isMove {
 		if err := os.Rename(srcPath, dstPath); err == nil {
 			// Success
+			p.logDebug("Rename successful: %s -> %s", ShellQuote(srcPath), ShellQuote(dstPath))
 			if node != nil && node.IsDir {
 				atomic.AddInt64(&p.stats.FoldersMerged, 1)
 			} else {
@@ -501,6 +501,7 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 			}
 			return nil
 		}
+		p.logDebug("Rename failed, falling back to copy+delete: %s -> %s", ShellQuote(srcPath), ShellQuote(dstPath))
 		// Fallback to copy+delete
 	}
 

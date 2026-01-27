@@ -20,24 +20,41 @@ type Progress struct {
 }
 
 func (p *Program) logOp(op MergeOperation, root string) {
-	finalDest := op.DestPath
-	if op.RenamedDestPath != "" {
-		finalDest = op.RenamedDestPath
-	}
-
-	rel := finalDest
+	rel := op.DestPath
 	if root != "" {
-		if r, err := filepath.Rel(root, finalDest); err == nil {
+		if r, err := filepath.Rel(root, op.DestPath); err == nil {
 			rel = r
 		}
 	}
 
-	action := op.Action
-	if op.DeleteDest {
-		action = "replace"
+	if p.cli.Verbose < 2 {
+		return
 	}
 
-	fmt.Fprintf(os.Stderr, "\n%-10s %s", action, ShellQuote(rel))
+	action := ""
+	if op.DeleteSrc && !op.Copy {
+		action = "delete"
+	} else if op.DeleteDest {
+		action = "replace"
+	} else if op.Copy {
+		if op.RenamedDestPath != "" {
+			action = "rename"
+		} else if op.DeleteSrc {
+			action = "move"
+		} else {
+			action = "copy"
+		}
+	}
+
+	if action != "" {
+		fmt.Fprintf(os.Stderr, "\n%-10s %s", action, ShellQuote(rel))
+	}
+}
+
+func (p *Program) logDebug(format string, a ...interface{}) {
+	if p.cli.Verbose >= 2 {
+		fmt.Fprintf(os.Stderr, "\nDEBUG: "+format, a...)
+	}
 }
 
 func (p *Program) updateWidth() {

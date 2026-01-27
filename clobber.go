@@ -44,19 +44,22 @@ func getUniqueFilename(basePath string, fs *FileSystem) string {
 func (p *Program) clobberFileOverFile(op *MergeOperation, src, dest *FileNode, targetPath string, strategy FileOverFileStrategy, simFS *FileSystem, ops *[]MergeOperation) {
 	// Check if same file
 	if src.Path == dest.Path {
-		op.Action = "skip"
+		p.logDebug("Skipping %s (same source and destination path)", ShellQuote(src.Path))
+		op.Copy = false
 		return
 	}
 	srcInfo, err1 := src.GetInfo()
 	destInfo, err2 := dest.GetInfo()
 	if err1 == nil && err2 == nil && os.SameFile(srcInfo, destInfo) {
-		op.Action = "skip"
+		p.logDebug("Skipping %s (same inode as destination)", ShellQuote(src.Path))
+		op.Copy = false
 		return
 	}
 
 	// Check if destination is empty or a symlink
 	destSize, _ := dest.GetSize()
 	if (destSize == 0 || dest.IsSymlink) && !src.IsSymlink {
+		p.logDebug("Replacing %s (destination is empty or symlink)", ShellQuote(targetPath))
 		op.DeleteDest = true
 		return
 	}
@@ -95,13 +98,16 @@ func (p *Program) clobberFileOverFile(op *MergeOperation, src, dest *FileNode, t
 		if shouldAct {
 			switch opt {
 			case SkipHash, SkipSize, SkipLarger, SkipSmaller:
-				op.Action = "skip"
+				p.logDebug("Skipping %s (matches optional strategy: %s)", ShellQuote(src.Path), opt)
+				op.Copy = false
 				return
 			case DeleteDestHash, DeleteDestSize, DeleteDestLarger, DeleteDestSmaller:
+				p.logDebug("Replacing %s (matches optional strategy: %s)", ShellQuote(targetPath), opt)
 				op.DeleteDest = true
 				return
 			case DeleteSrcHash, DeleteSrcSize, DeleteSrcLarger, DeleteSrcSmaller:
-				op.Action = "skip"
+				p.logDebug("Deleting source %s (matches optional strategy: %s)", ShellQuote(src.Path), opt)
+				op.Copy = false
 				op.DeleteSrc = true
 				return
 			}
@@ -112,55 +118,68 @@ func (p *Program) clobberFileOverFile(op *MergeOperation, src, dest *FileNode, t
 	// Apply required fallback
 	switch strategy.Required {
 	case FFSkip:
-		op.Action = "skip"
+		p.logDebug("Skipping %s (required strategy: skip)", ShellQuote(src.Path))
+		op.Copy = false
 	case FFDeleteSrc:
-		op.Action = "skip"
+		p.logDebug("Deleting source %s (required strategy: delete-src)", ShellQuote(src.Path))
+		op.Copy = false
 		op.DeleteSrc = true
 	case FFDeleteDest:
+		p.logDebug("Replacing %s (required strategy: delete-dest)", ShellQuote(targetPath))
 		op.DeleteDest = true
 	case FFRenameSrc:
 		newPath := getUniqueFilename(targetPath, simFS)
+		p.logDebug("Renaming source %s -> %s (required strategy: rename-src)", ShellQuote(src.Path), ShellQuote(newPath))
 		// Keep action as move/copy, just redirect to newPath
 		op.RenamedDestPath = newPath
 	case FFRenameDest:
 		// destination needs to be renamed first
 		newPath := getUniqueFilename(targetPath, simFS)
+		p.logDebug("Renaming destination %s -> %s (required strategy: rename-dest)", ShellQuote(targetPath), ShellQuote(newPath))
 		// Emit rename for destination, then proceed with normal move/copy
 		*ops = append(*ops, MergeOperation{
-			SrcPath:  op.DestPath,
-			DestPath: newPath,
-			Action:   "rename",
-			IsDir:    dest.IsDir,
+			SrcPath:   op.DestPath,
+			DestPath:  newPath,
+			Copy:      true,
+			DeleteSrc: true,
+			IsDir:     dest.IsDir,
 		})
 		simFS.Delete(op.DestPath)
 		simFS.Add(newPath, dest.Clone(newPath))
 		// Keep action as move/copy to original DestPath (now free)
 	default:
-		op.Action = "skip"
+		p.logDebug("Skipping %s (unknown required strategy, defaulting to skip)", ShellQuote(src.Path))
+		op.Copy = false
 	}
 }
 
 func (p *Program) clobber(op *MergeOperation, src, dest *FileNode, targetPath string, mode ConflictMode, simFS *FileSystem, ops *[]MergeOperation) {
 	switch mode {
 	case CSkip:
-		op.Action = "skip"
+		p.logDebug("Skipping %s (conflict strategy: skip)", ShellQuote(src.Path))
+		op.Copy = false
 	case CDeleteSrc:
-		op.Action = "skip"
+		p.logDebug("Deleting source %s (conflict strategy: delete-src)", ShellQuote(src.Path))
+		op.Copy = false
 		op.DeleteSrc = true
 	case CDeleteDest:
+		p.logDebug("Replacing %s (conflict strategy: delete-dest)", ShellQuote(targetPath))
 		op.DeleteDest = true
 	case CRenameSrc:
 		newPath := getUniqueFilename(targetPath, simFS)
+		p.logDebug("Renaming source %s -> %s (conflict strategy: rename-src)", ShellQuote(src.Path), ShellQuote(newPath))
 		// Keep action as move/copy, just redirect to newPath
 		op.RenamedDestPath = newPath
 	case CRenameDest:
 		newPath := getUniqueFilename(targetPath, simFS)
+		p.logDebug("Renaming destination %s -> %s (conflict strategy: rename-dest)", ShellQuote(targetPath), ShellQuote(newPath))
 		// Emit rename for destination
 		*ops = append(*ops, MergeOperation{
-			SrcPath:  op.DestPath,
-			DestPath: newPath,
-			Action:   "rename",
-			IsDir:    dest.IsDir,
+			SrcPath:   op.DestPath,
+			DestPath:  newPath,
+			Copy:      true,
+			DeleteSrc: true,
+			IsDir:     dest.IsDir,
 		})
 		simFS.Delete(op.DestPath)
 		simFS.Add(newPath, dest.Clone(newPath))
@@ -169,12 +188,14 @@ func (p *Program) clobber(op *MergeOperation, src, dest *FileNode, targetPath st
 		if src.IsDir && !dest.IsDir {
 			// Folder over File - Merge mode requires the file to be moved out of the way
 			newPath := getUniqueFilename(targetPath, simFS)
+			p.logDebug("Renaming destination %s -> %s (folder-over-file merge strategy)", ShellQuote(targetPath), ShellQuote(newPath))
 			// Emit rename for destination
 			*ops = append(*ops, MergeOperation{
-				SrcPath:  op.DestPath,
-				DestPath: newPath,
-				Action:   "rename",
-				IsDir:    dest.IsDir,
+				SrcPath:   op.DestPath,
+				DestPath:  newPath,
+				Copy:      true,
+				DeleteSrc: true,
+				IsDir:     dest.IsDir,
 			})
 			simFS.Delete(op.DestPath)
 			simFS.Add(newPath, dest.Clone(newPath))
@@ -183,11 +204,13 @@ func (p *Program) clobber(op *MergeOperation, src, dest *FileNode, targetPath st
 			// Move into the conflicting folder/file
 			baseName := filepath.Base(src.Path)
 			newPath := filepath.Join(targetPath, baseName)
+			p.logDebug("Moving %s -> %s (merge strategy)", ShellQuote(src.Path), ShellQuote(newPath))
 			// Keep action as move/copy, redirect to newPath inside the directory
 			op.RenamedDestPath = newPath
 		}
 	default:
-		op.Action = "skip"
+		p.logDebug("Skipping %s (unknown conflict strategy, defaulting to skip)", ShellQuote(src.Path))
+		op.Copy = false
 	}
 }
 
