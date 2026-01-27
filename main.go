@@ -72,7 +72,7 @@ func main() {
 	// Process each source
 	for _, src := range cli.Sources {
 		if _, err := os.Stat(src); err != nil {
-			fmt.Fprintf(os.Stderr, "Source %s does not exist", src)
+			fmt.Fprintf(os.Stderr, "Source %s does not exist\n", ShellQuote(src))
 			continue
 		}
 
@@ -80,7 +80,7 @@ func main() {
 		// Stream parallel processing
 		err := p.processSource(src, srcFS, destFS)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error processing source %s: %v", src, err)
+			fmt.Fprintf(os.Stderr, "Error processing source %s: %v\n", ShellQuote(src), err)
 		}
 
 		// Clean up empty directories
@@ -116,16 +116,16 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 					if err := p.executeOperation(op, job.Root); err != nil {
 						atomic.AddInt64(&p.stats.Errors, 1)
 						select {
-						case errChan <- fmt.Errorf("%s: %w", op.SrcPath, err):
+						case errChan <- fmt.Errorf("%s: %w", ShellQuote(op.SrcPath), err):
 						default:
 							if p.cli.Verbose > 1 {
-								fmt.Fprintf(os.Stderr, "\nError (buffer full): %s: %v\n", op.SrcPath, err)
+								fmt.Fprintf(os.Stderr, "\nError (buffer full): %s: %v\n", ShellQuote(op.SrcPath), err)
 							}
 						}
 
 						fmt.Fprintf(os.Stderr, "\nError in job: skipping remaining ops:\n")
 						for _, op := range job.Ops {
-							fmt.Fprintf(os.Stderr, "  %v: %s\n", op.Action, op.SrcPath)
+							fmt.Fprintf(os.Stderr, "  %v: %s\n", op.Action, ShellQuote(op.SrcPath))
 						}
 						break
 					}
@@ -228,8 +228,8 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	}
 
 	// Capture initial stats before processing this source
-	initialFiles := atomic.LoadInt64(&p.stats.FilesProcessed)
-	initialFolders := atomic.LoadInt64(&p.stats.FoldersProcessed)
+	initialFiles := atomic.LoadInt64(&p.stats.FilesMerged)
+	initialFolders := atomic.LoadInt64(&p.stats.FoldersMerged)
 	initialBytes := atomic.LoadInt64(&p.stats.BytesMoved)
 
 	var scheduledFiles, scheduledFolders, scheduledBytes int64
@@ -495,9 +495,9 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 		if err := os.Rename(srcPath, dstPath); err == nil {
 			// Success
 			if node != nil && node.IsDir {
-				atomic.AddInt64(&p.stats.FoldersProcessed, 1)
+				atomic.AddInt64(&p.stats.FoldersMerged, 1)
 			} else {
-				atomic.AddInt64(&p.stats.FilesProcessed, 1)
+				atomic.AddInt64(&p.stats.FilesMerged, 1)
 			}
 			return nil
 		}
@@ -519,7 +519,7 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 		if err := os.Symlink(target, dstPath); err != nil {
 			return err
 		}
-		atomic.AddInt64(&p.stats.FilesProcessed, 1)
+		atomic.AddInt64(&p.stats.FilesMerged, 1)
 
 		if isMove {
 			return os.Remove(srcPath)
@@ -555,7 +555,7 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 				return err
 			}
 		}
-		atomic.AddInt64(&p.stats.FoldersProcessed, 1)
+		atomic.AddInt64(&p.stats.FoldersMerged, 1)
 
 		if isMove {
 			return os.Remove(srcPath)
@@ -570,7 +570,7 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 
 	size, _ := node.GetSize()
 	atomic.AddInt64(&p.stats.BytesMoved, size)
-	atomic.AddInt64(&p.stats.FilesProcessed, 1)
+	atomic.AddInt64(&p.stats.FilesMerged, 1)
 
 	if isMove {
 		return os.Remove(srcPath)

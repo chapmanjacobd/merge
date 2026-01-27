@@ -7,6 +7,18 @@ import (
 	"strings"
 )
 
+var safeChars = regexp.MustCompile(`^[a-zA-Z0-9!@%_+=:,./-]+$`)
+
+func ShellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if safeChars.MatchString(s) {
+		return "'" + s + "'"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
 func truncateMiddle(s string, max int) string {
 	if len(s) <= max {
 		return s

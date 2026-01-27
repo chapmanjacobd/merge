@@ -37,7 +37,7 @@ func (p *Program) logOp(op MergeOperation, root string) {
 		action = "replace"
 	}
 
-	fmt.Fprintf(os.Stderr, "\n%-10s %s", action, rel)
+	fmt.Fprintf(os.Stderr, "\n%-10s %s", action, ShellQuote(rel))
 }
 
 func (p *Program) updateWidth() {
@@ -56,7 +56,7 @@ func (p *Program) printProgress() {
 		return
 	}
 
-	files := atomic.LoadInt64(&p.stats.FilesProcessed)
+	files := atomic.LoadInt64(&p.stats.FilesMerged)
 	bytes := atomic.LoadInt64(&p.stats.BytesMoved)
 	elapsed := time.Since(p.progress.start).Seconds()
 

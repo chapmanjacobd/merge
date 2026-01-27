@@ -353,9 +353,9 @@ func TestHashSkipEarlyDifferent(t *testing.T) {
 		t.Errorf("Expected no full hashes for different files, got %d", p.stats.FullHashes)
 	}
 
-	// Files are different, so should not skip
-	if p.stats.FilesProcessed == 0 {
-		t.Error("Expected files to be processed")
+	// Files are different, so should be merged
+	if p.stats.FilesMerged == 0 {
+		t.Error("Expected files to be merged")
 	}
 }
 
@@ -404,11 +404,11 @@ func TestHashSkipFullHashIdentical(t *testing.T) {
 	}
 
 	// Should skip identical files
-	if p.stats.FilesProcessed > 0 {
-		// FilesProcessed counts transfers/moves. If skipped, it shouldn't increment?
+	if p.stats.FilesMerged > 0 {
+		// FilesMerged counts transfers/moves. If skipped, it shouldn't increment?
 		// Check processSource implementation.
 		// If action is skip, we return nil in executeOperation, no stats increment.
-		t.Errorf("Expected no files processed for identical files, got %d", p.stats.FilesProcessed)
+		t.Errorf("Expected no files merged for identical files, got %d", p.stats.FilesMerged)
 	}
 }
 
@@ -1074,8 +1074,8 @@ func TestSampleHashMiddleDifference(t *testing.T) {
 	}
 
 	// Should process 1 file (move)
-	if p.stats.FilesProcessed == 0 {
-		t.Error("Expected file to be processed")
+	if p.stats.FilesMerged == 0 {
+		t.Error("Expected file to be merged")
 	}
 }
 
