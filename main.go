@@ -611,9 +611,16 @@ func (p *Program) streamScan(root string, fs *FileSystem) <-chan string {
 
 	go func() {
 		defer close(out)
-		filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		absRoot, _ := filepath.Abs(root)
+		destAbs, _ := filepath.Abs(p.cli.Destination)
+
+		filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
+			}
+
+			if d.IsDir() && path == destAbs {
+				return filepath.SkipDir
 			}
 
 			info, err := d.Info()

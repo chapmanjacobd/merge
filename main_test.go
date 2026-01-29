@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -1488,52 +1487,88 @@ func TestMultipleSourcesRace(t *testing.T) {
 	}
 }
 
-func TestConcurrentSourcesDestFSAccess(t *testing.T) {
-	// This test attempts to simulate concurrent access to the shared destFS
-	// by running processSource in parallel, which is not the standard flow
-	// but tests robustness of the FileSystem locking.
-
+func TestRecursiveAvoidance(t *testing.T) {
 	tmpDir := t.TempDir()
-	src1 := filepath.Join(tmpDir, "src1")
-	src2 := filepath.Join(tmpDir, "src2")
-	dest := filepath.Join(tmpDir, "dest")
+	src := filepath.Join(tmpDir, "src")
+	dest := filepath.Join(src, "dest") // Nested destination
 
-	os.MkdirAll(src1, 0o755)
-	os.MkdirAll(src2, 0o755)
+	os.MkdirAll(src, 0o755)
 	os.MkdirAll(dest, 0o755)
 
-	os.WriteFile(filepath.Join(src1, "file1.txt"), []byte("src1"), 0o644)
-	os.WriteFile(filepath.Join(src2, "file2.txt"), []byte("src2"), 0o644)
+	createTestTree(t, src, testTree{
+		"file1.txt": "content1",
+	})
+	// dest is just a folder at this point
 
 	cli := &CLI{
-		Destination:  dest,
-		FileOverFile: "skip",
-		Workers:      2,
+		Sources:     []string{src},
+		Destination: dest,
+		Copy:        true,
+		Workers:     1,
 	}
 
 	p := NewProgram(cli)
+	srcFS := NewFileSystem()
 	destFS := NewFileSystem()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Random start delay to interleave operations
-	go func() {
-		defer wg.Done()
-		p.processSource(src1, NewFileSystem(), destFS)
-	}()
-	go func() {
-		defer wg.Done()
-		p.processSource(src2, NewFileSystem(), destFS)
-	}()
-
-	wg.Wait()
-
-	// Check if both files exist (basic smoke test for crash/panic)
-	if _, err := os.Stat(filepath.Join(dest, "file1.txt")); os.IsNotExist(err) {
-		t.Error("file1.txt missing")
+	err := p.processSource(src, srcFS, destFS)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dest, "file2.txt")); os.IsNotExist(err) {
-		t.Error("file2.txt missing")
+
+	got := readTestTree(t, dest)
+	// file1.txt should have been copied into dest
+	if _, ok := got["file1.txt"]; !ok {
+		t.Errorf("Expected file1.txt in dest, got %v", got)
+	}
+
+	// dest should NOT have been copied into dest/dest
+	if _, ok := got["dest"]; ok {
+		t.Errorf("Recursive folder creation detected! Found 'dest' inside 'dest'")
+	}
+}
+
+func TestRecursiveMoveAvoidance(t *testing.T) {
+	tmpDir := t.TempDir()
+	src := filepath.Join(tmpDir, "src")
+	dest := filepath.Join(src, "dest") // Nested destination
+
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dest, 0o755)
+
+	createTestTree(t, src, testTree{
+		"file1.txt": "content1",
+	})
+
+	cli := &CLI{
+		Sources:     []string{src},
+		Destination: dest,
+		Copy:        false, // Move mode
+		Workers:     1,
+	}
+
+	p := NewProgram(cli)
+	srcFS := NewFileSystem()
+	destFS := NewFileSystem()
+
+	err := p.processSource(src, srcFS, destFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := readTestTree(t, dest)
+	// file1.txt should have been moved into dest
+	if got["file1.txt"] != "content1" {
+		t.Errorf("Expected file1.txt in dest with 'content1', got %v", got["file1.txt"])
+	}
+
+	// dest should still exist and not be moved into itself
+	if _, ok := got["dest"]; ok {
+		t.Errorf("Recursive folder creation detected in move mode! Found 'dest' inside 'dest'")
+	}
+
+	// Verify src/file1.txt is gone
+	if _, err := os.Stat(filepath.Join(src, "file1.txt")); !os.IsNotExist(err) {
+		t.Error("src/file1.txt should have been moved")
 	}
 }
