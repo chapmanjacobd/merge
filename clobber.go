@@ -100,6 +100,7 @@ func (p *Program) clobberFileOverFile(op *MergeOperation, src, dest *FileNode, t
 			case SkipHash, SkipSize, SkipLarger, SkipSmaller:
 				p.logDebug("Skipping %s (matches optional strategy: %s)", ShellQuote(src.Path), opt)
 				op.Copy = false
+				op.DeleteSrc = false
 				return
 			case DeleteDestHash, DeleteDestSize, DeleteDestLarger, DeleteDestSmaller:
 				p.logDebug("Replacing %s (matches optional strategy: %s)", ShellQuote(targetPath), opt)
@@ -120,6 +121,7 @@ func (p *Program) clobberFileOverFile(op *MergeOperation, src, dest *FileNode, t
 	case FFSkip:
 		p.logDebug("Skipping %s (required strategy: skip)", ShellQuote(src.Path))
 		op.Copy = false
+		op.DeleteSrc = false
 	case FFDeleteSrc:
 		p.logDebug("Deleting source %s (required strategy: delete-src)", ShellQuote(src.Path))
 		op.Copy = false
@@ -158,6 +160,7 @@ func (p *Program) clobber(op *MergeOperation, src, dest *FileNode, targetPath st
 	case CSkip:
 		p.logDebug("Skipping %s (conflict strategy: skip)", ShellQuote(src.Path))
 		op.Copy = false
+		op.DeleteSrc = false
 	case CDeleteSrc:
 		p.logDebug("Deleting source %s (conflict strategy: delete-src)", ShellQuote(src.Path))
 		op.Copy = false
@@ -211,6 +214,7 @@ func (p *Program) clobber(op *MergeOperation, src, dest *FileNode, targetPath st
 	default:
 		p.logDebug("Skipping %s (unknown conflict strategy, defaulting to skip)", ShellQuote(src.Path))
 		op.Copy = false
+		op.DeleteSrc = false
 	}
 }
 

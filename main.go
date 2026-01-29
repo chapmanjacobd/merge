@@ -124,7 +124,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 							}
 						}
 
-						fmt.Fprintf(os.Stderr, "\nError in job: skipping remaining ops:\n")
+						fmt.Fprintf(os.Stderr, "\nError in job: %v\nSkipping remaining ops:\n", err)
 						for _, op := range job.Ops {
 							action := "copy"
 							if op.DeleteSrc {
@@ -152,6 +152,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	destFS.mu.RUnlock()
 
 	fileStrategy := parseFileOverFile(p.cli.FileOverFile)
+	isMove := !p.cli.Copy
 	skipPrefix := ""
 
 	maxBytes := int64(0)
@@ -318,7 +319,7 @@ outerloop:
 			IsDir:     srcNode.IsDir,
 			SrcNode:   srcNode,
 			SrcFS:     srcFS,
-			DeleteSrc: !p.cli.Copy,
+			DeleteSrc: false,
 		}
 
 		var jobOps []MergeOperation
@@ -338,11 +339,12 @@ outerloop:
 				// File over file
 				atomic.AddInt64(&p.stats.FileOverFile, 1)
 				op.Copy = true
+				op.DeleteSrc = isMove
 				p.clobberFileOverFile(&op, srcNode, destNode, destPath, fileStrategy, simFS, &jobOps)
 				if op.DeleteDest {
 					simFS.Delete(op.DestPath)
 				}
-				if !op.DeleteSrc && op.Copy {
+				if op.Copy {
 					finalPath := op.DestPath
 					if op.RenamedDestPath != "" {
 						finalPath = op.RenamedDestPath
@@ -353,12 +355,13 @@ outerloop:
 				// File over folder
 				atomic.AddInt64(&p.stats.FileOverFolder, 1)
 				op.Copy = true
+				op.DeleteSrc = isMove
 				mode := ConflictMode(p.cli.FileOverFolder)
 				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &jobOps)
 				if op.DeleteDest {
 					simFS.Delete(op.DestPath)
 				}
-				if !op.DeleteSrc && op.Copy {
+				if op.Copy {
 					finalPath := op.DestPath
 					if op.RenamedDestPath != "" {
 						finalPath = op.RenamedDestPath
@@ -369,12 +372,13 @@ outerloop:
 				// Folder over file
 				atomic.AddInt64(&p.stats.FolderOverFile, 1)
 				op.Copy = true
+				op.DeleteSrc = isMove
 				mode := ConflictMode(p.cli.FolderOverFile)
 				p.clobber(&op, srcNode, destNode, destPath, mode, simFS, &jobOps)
 				if op.DeleteDest {
 					simFS.Delete(op.DestPath)
 				}
-				if !op.DeleteSrc && op.Copy {
+				if op.Copy {
 					finalPath := op.DestPath
 					if op.RenamedDestPath != "" {
 						finalPath = op.RenamedDestPath
@@ -384,6 +388,7 @@ outerloop:
 			}
 		} else {
 			op.Copy = true
+			op.DeleteSrc = isMove
 			simFS.Add(destPath, srcNode.Clone(destPath))
 		}
 

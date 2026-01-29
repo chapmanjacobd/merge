@@ -1394,14 +1394,25 @@ func TestMultipleSourcesRace(t *testing.T) {
 
 	// Setup src1
 	for i := 0; i < numFiles; i++ {
+		// Case 1: Standard File (File Over File)
 		fname := fmt.Sprintf("file_%d", i)
 		if err := os.WriteFile(filepath.Join(src1, fname), []byte("src1"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+
+		// Case 2: Folder that will be conflicted by a File (File Over Folder)
+		fdir1 := fmt.Sprintf("dir_fover_%d", i)
+		os.MkdirAll(filepath.Join(src1, fdir1), 0o755)
+		os.WriteFile(filepath.Join(src1, fdir1, "exist.txt"), []byte("exist"), 0o644)
+
+		// Case 3: File that will be conflicted by a Folder (Folder Over File)
+		ffile1 := fmt.Sprintf("file_fover_%d", i)
+		os.WriteFile(filepath.Join(src1, ffile1), []byte("exist"), 0o644)
 	}
 
 	// Setup src2
 	for i := 0; i < numFiles; i++ {
+		// Case 1: File Over File (Existing chain)
 		// file_i: will conflict with dest/file_i (from src1), causing dest/file_i -> dest/file_i_1
 		fname := fmt.Sprintf("file_%d", i)
 		if err := os.WriteFile(filepath.Join(src2, fname), []byte("src2_main"), 0o644); err != nil {
@@ -1411,6 +1422,23 @@ func TestMultipleSourcesRace(t *testing.T) {
 		// file_i_1: will conflict with dest/file_i_1 (created by above rename), causing dest/file_i_1 -> dest/file_i_2
 		fnamesub := fmt.Sprintf("file_%d_1", i)
 		if err := os.WriteFile(filepath.Join(src2, fnamesub), []byte("src2_sub"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Case 2: File Over Folder (src2 has file, dest has folder)
+		// Strategy "merge" for FileOverFolder moves file INTO folder (e.g. dir_fover_i/dir_fover_i)
+		fdir1_name := fmt.Sprintf("dir_fover_%d", i)
+		if err := os.WriteFile(filepath.Join(src2, fdir1_name), []byte("newfile"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Case 3: Folder Over File (src2 has folder, dest has file)
+		// Strategy "merge" for FolderOverFile renames file and creates folder (e.g. file_fover_i -> file_fover_i_1)
+		ffile1_name := fmt.Sprintf("file_fover_%d", i)
+		if err := os.MkdirAll(filepath.Join(src2, ffile1_name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src2, ffile1_name, "new.txt"), []byte("new"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1441,6 +1469,9 @@ func TestMultipleSourcesRace(t *testing.T) {
 	// Validation
 	count := 0
 	filepath.Walk(dest, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
 		if !info.IsDir() {
 			count++
 		}
@@ -1448,10 +1479,10 @@ func TestMultipleSourcesRace(t *testing.T) {
 	})
 
 	// Expected files per 'i':
-	// dest/file_i (content: src2_main)
-	// dest/file_i_1 (content: src2_sub)
-	// dest/file_i_2 (content: src1 - originally file_i, renamed to _1, then to _2)
-	expected := numFiles * 3
+	// Case 1: 3 files (src2_main, src2_sub, src1_renamed_twice)
+	// Case 2: 2 files (src1/exist.txt, src2/newfile_moved_into_folder)
+	// Case 3: 2 files (src1_renamed_once, src2/new.txt)
+	expected := numFiles * 7
 	if count != expected {
 		t.Errorf("Expected %d files, got %d", expected, count)
 	}
