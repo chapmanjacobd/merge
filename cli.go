@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/alecthomas/kong"
 )
 
 type CLI struct {
@@ -37,7 +39,7 @@ type CLI struct {
 	DestFolder bool `help:"Destination is always a folder" aliases:"folder" short:"t"`
 	DestFile   bool `help:"Destination is a file (no-target-directory)" aliases:"file" short:"T"`
 
-	Resume string `help:"Text file containing relative paths to process" short:"r" placeholder:"FILE"`
+	Version kong.VersionFlag `help:"Print version information and exit"`
 }
 
 func (c *CLI) AfterApply() error {

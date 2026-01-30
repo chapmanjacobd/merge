@@ -1,11 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +14,27 @@ import (
 
 	"github.com/alecthomas/kong"
 )
+
+var (
+	version = "dev"
+	commit  = "none"
+)
+
+func getVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if version == "dev" && info.Main.Version != "" && info.Main.Version != "(devel)" {
+			version = info.Main.Version
+		}
+		if commit == "none" {
+			for _, setting := range info.Settings {
+				if setting.Key == "vcs.revision" {
+					commit = setting.Value
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("%s (%s)", version, commit)
+}
 
 type Program struct {
 	cli        *CLI
@@ -61,6 +82,9 @@ func main() {
 		kong.Name("merge"),
 		kong.Description("Merge folders with apriori conflict resolution"),
 		kong.UsageOnError(),
+		kong.Vars{
+			"version": getVersion(),
+		},
 	)
 
 	p := NewProgram(cli)
@@ -653,28 +677,6 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 
 func (p *Program) streamScan(root string, fs *FileSystem) <-chan string {
 	out := make(chan string, 1024)
-
-	if p.cli.Resume != "" {
-		if _, err := os.Stat(p.cli.Resume); err == nil {
-			go func() {
-				defer close(out)
-				f, err := os.Open(p.cli.Resume)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error opening resume file: %v\n", err)
-					return
-				}
-				defer f.Close()
-
-				scanner := bufio.NewScanner(f)
-				for scanner.Scan() {
-					rel := scanner.Text()
-					path := filepath.Join(root, rel)
-					out <- path
-				}
-			}()
-			return out
-		}
-	}
 
 	go func() {
 		defer close(out)
