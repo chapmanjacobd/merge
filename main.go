@@ -95,12 +95,20 @@ func main() {
 }
 
 func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileSystem) error {
-	// Worker pool setup
+	// 1. Planning Phase (Synchronous)
+	// We generate all jobs first to ensure we have a complete and consistent view of the dependencies.
+	// This removes the complexity of pipelining and ensures simFS is fully built before execution matches.
+	plannedJobs, finalSimFS, err := p.planJobs(srcRoot, srcFS, destFS)
+	if err != nil {
+		return err
+	}
+
+	// 2. Execution Phase
 	numWorkers := p.cli.Workers
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
-	jobChan := make(chan MergeJob) // Unbuffered to ensure scheduler controls dispatch
+	jobChan := make(chan MergeJob) // Unbuffered
 	doneChan := make(chan MergeJob, numWorkers*2)
 	errChan := make(chan error, 128)
 	var wg sync.WaitGroup
@@ -130,19 +138,10 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 		}()
 	}
 
-	// Channel for planned jobs and final simFS
-	plannedJobsChan := make(chan MergeJob, 1024)
-	simReturnChan := make(chan *FileSystem, 1)
-
-	// Start Planner
-	go p.generateJobs(srcRoot, srcFS, destFS, plannedJobsChan, simReturnChan)
-
 	// Scheduler State
-	pendingJobs := []MergeJob{}
+	pendingJobs := plannedJobs
 	activePaths := make(map[string]int)
 	activeWorkers := 0
-	plannerFinished := false
-	var finalSimFS *FileSystem
 
 	// Helper to collect paths from a job
 	getJobPaths := func(job MergeJob) []string {
@@ -152,6 +151,8 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 			if p == "" {
 				return
 			}
+			// Clean the path to ensure consistent locking keys
+			p = filepath.Clean(p)
 			if !seen[p] {
 				seen[p] = true
 				paths = append(paths, p)
@@ -205,27 +206,16 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 		}
 
 		// Exit condition
-		if plannerFinished && len(pendingJobs) == 0 && activeWorkers == 0 {
+		if len(pendingJobs) == 0 && activeWorkers == 0 {
 			break
 		}
 
 		// Deadlock Detection
-		if plannerFinished && len(pendingJobs) > 0 && activeWorkers == 0 && nextJobIdx == -1 {
+		if len(pendingJobs) > 0 && activeWorkers == 0 && nextJobIdx == -1 {
 			return fmt.Errorf("deadlock detected: %d jobs pending but none runnable and no active workers", len(pendingJobs))
 		}
 
 		select {
-		case job, ok := <-plannedJobsChan:
-			if !ok {
-				plannedJobsChan = nil
-				plannerFinished = true
-			} else {
-				pendingJobs = append(pendingJobs, job)
-			}
-
-		case simResult := <-simReturnChan:
-			finalSimFS = simResult
-
 		case completedJob := <-doneChan:
 			paths := getJobPaths(completedJob)
 			for _, path := range paths {
@@ -245,10 +235,6 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 			activeWorkers++
 			// Remove from pending
 			pendingJobs = append(pendingJobs[:nextJobIdx], pendingJobs[nextJobIdx+1:]...)
-
-		case <-time.After(1 * time.Second):
-			// Safety timeout to avoid spinning too fast if everything is blocked
-			// Also allows checking exit conditions periodically
 		}
 	}
 
@@ -257,15 +243,6 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 
 	if p.cli.Verbose > 0 {
 		fmt.Fprint(os.Stderr, "\r\033[K")
-	}
-
-	// Wait for the simulation result if we don't have it yet
-	if finalSimFS == nil && simReturnChan != nil {
-		select {
-		case simResult := <-simReturnChan:
-			finalSimFS = simResult
-		case <-time.After(100 * time.Millisecond):
-		}
 	}
 
 	// Synchronize the simulated state back to destFS for the next source
@@ -293,9 +270,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	return nil
 }
 
-func (p *Program) generateJobs(srcRoot string, srcFS *FileSystem, destFS *FileSystem, jobChan chan<- MergeJob, simReturn chan<- *FileSystem) {
-	defer close(jobChan)
-
+func (p *Program) planJobs(srcRoot string, srcFS *FileSystem, destFS *FileSystem) ([]MergeJob, *FileSystem, error) {
 	simFS := NewFileSystem()
 	// Copy existing destination into simulation
 	destFS.mu.RLock()
@@ -307,12 +282,7 @@ func (p *Program) generateJobs(srcRoot string, srcFS *FileSystem, destFS *FileSy
 	}
 	destFS.mu.RUnlock()
 
-	defer func() {
-		select {
-		case simReturn <- simFS:
-		default:
-		}
-	}()
+	var jobs []MergeJob
 
 	fileStrategy := parseFileOverFile(p.cli.FileOverFile)
 	isMove := !p.cli.Copy
@@ -330,8 +300,7 @@ func (p *Program) generateJobs(srcRoot string, srcFS *FileSystem, destFS *FileSy
 	}
 	relRoot, err := filepath.Abs(relRoot)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting absolute path for %s: %v\n", ShellQuote(relRoot), err)
-		return
+		return nil, nil, fmt.Errorf("error getting absolute path for %s: %w", ShellQuote(relRoot), err)
 	}
 
 	pathChan := p.streamScan(srcRoot, srcFS)
@@ -537,7 +506,7 @@ outerloop:
 
 		if op.Copy || op.DeleteSrc || op.DeleteDest {
 			jobOps = append(jobOps, op)
-			jobChan <- MergeJob{Ops: jobOps, Root: destRoot}
+			jobs = append(jobs, MergeJob{Ops: jobOps, Root: destRoot})
 
 			if !op.IsDir {
 				sz, _ := srcNode.GetSize()
@@ -552,6 +521,7 @@ outerloop:
 			}
 		}
 	}
+	return jobs, simFS, nil
 }
 
 func (p *Program) executeOperation(op MergeOperation, root string) error {
