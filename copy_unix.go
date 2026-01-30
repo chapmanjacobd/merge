@@ -17,7 +17,9 @@ func copyFile(src, dst string) error {
 
 	cmd := exec.Command("cp", "-pT", src, dst)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(dst)
+		if _, err := os.Stat(src); err == nil {
+			_ = os.Remove(dst)
+		}
 		return fmt.Errorf("cp failed: %s", bytes.TrimSpace(out))
 	}
 	return nil

@@ -95,14 +95,13 @@ func main() {
 }
 
 func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileSystem) error {
-	pathChan := p.streamScan(srcRoot, srcFS)
-
 	// Worker pool setup
 	numWorkers := p.cli.Workers
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
-	jobChan := make(chan MergeJob, numWorkers*2)
+	jobChan := make(chan MergeJob) // Unbuffered to ensure scheduler controls dispatch
+	doneChan := make(chan MergeJob, numWorkers*2)
 	errChan := make(chan error, 128)
 	var wg sync.WaitGroup
 
@@ -117,29 +116,186 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 					if err := p.executeOperation(op, job.Root); err != nil {
 						atomic.AddInt64(&p.stats.Errors, 1)
 						select {
-						case errChan <- fmt.Errorf("%s: %w", ShellQuote(op.SrcPath), err):
+						case errChan <- fmt.Errorf("%s: %v", ShellQuote(op.SrcPath), err):
 						default:
 							if p.cli.Verbose > 0 {
-								fmt.Fprintf(os.Stderr, "\nError (buffer full): %s: %v\n", ShellQuote(op.SrcPath), err)
+								p.printLog(fmt.Sprintf("Error (buffer full): %s: %v", ShellQuote(op.SrcPath), err))
 							}
 						}
-
-						fmt.Fprintf(os.Stderr, "\nError in job: %v\nSkipping remaining ops:\n", err)
-						for _, op := range job.Ops {
-							action := "copy"
-							if op.DeleteSrc {
-								action = "move"
-							}
-							fmt.Fprintf(os.Stderr, "  %v: %s\n", action, ShellQuote(op.SrcPath))
-						}
-						break
+						p.printLog(fmt.Sprintf("Error in job: %v", err))
 					}
 				}
+				doneChan <- job
 			}
 		}()
 	}
 
-	// Planner (runs in main routine or single goroutine to maintain state)
+	// Channel for planned jobs and final simFS
+	plannedJobsChan := make(chan MergeJob, 1024)
+	simReturnChan := make(chan *FileSystem, 1)
+
+	// Start Planner
+	go p.generateJobs(srcRoot, srcFS, destFS, plannedJobsChan, simReturnChan)
+
+	// Scheduler State
+	pendingJobs := []MergeJob{}
+	activePaths := make(map[string]int)
+	activeWorkers := 0
+	plannerFinished := false
+	var finalSimFS *FileSystem
+
+	// Helper to collect paths from a job
+	getJobPaths := func(job MergeJob) []string {
+		var paths []string
+		seen := make(map[string]bool)
+		add := func(p string) {
+			if p == "" {
+				return
+			}
+			if !seen[p] {
+				seen[p] = true
+				paths = append(paths, p)
+			}
+		}
+		for _, op := range job.Ops {
+			add(op.DestPath)
+			add(op.RenamedDestPath)
+			add(op.SrcPath)
+		}
+		return paths
+	}
+
+	for {
+		// Find first runnable job in pending queue (FIFO priority for dependent jobs)
+		var nextJob MergeJob
+		nextJobIdx := -1
+
+		// Preserve FIFO for dependent jobs by keeping track of paths touched by preceding blocked jobs
+		blockedByPending := make(map[string]bool)
+		for p := range activePaths {
+			blockedByPending[p] = true
+		}
+
+		for i, job := range pendingJobs {
+			conflict := false
+			paths := getJobPaths(job)
+			for _, path := range paths {
+				if blockedByPending[path] {
+					conflict = true
+					break
+				}
+			}
+
+			if !conflict {
+				nextJob = job
+				nextJobIdx = i
+				break
+			}
+
+			// This job is blocked, so ALL its paths are now blocked for subsequent jobs in the queue
+			for _, path := range paths {
+				blockedByPending[path] = true
+			}
+		}
+
+		// Prepare send channel if we have a runnable job
+		var outChan chan<- MergeJob
+		if nextJobIdx != -1 {
+			outChan = jobChan
+		}
+
+		// Exit condition
+		if plannerFinished && len(pendingJobs) == 0 && activeWorkers == 0 {
+			break
+		}
+
+		// Deadlock Detection
+		if plannerFinished && len(pendingJobs) > 0 && activeWorkers == 0 && nextJobIdx == -1 {
+			return fmt.Errorf("deadlock detected: %d jobs pending but none runnable and no active workers", len(pendingJobs))
+		}
+
+		select {
+		case job, ok := <-plannedJobsChan:
+			if !ok {
+				plannedJobsChan = nil
+				plannerFinished = true
+			} else {
+				pendingJobs = append(pendingJobs, job)
+			}
+
+		case simResult := <-simReturnChan:
+			finalSimFS = simResult
+
+		case completedJob := <-doneChan:
+			paths := getJobPaths(completedJob)
+			for _, path := range paths {
+				activePaths[path]--
+				if activePaths[path] <= 0 {
+					delete(activePaths, path)
+				}
+			}
+			activeWorkers--
+
+		case outChan <- nextJob:
+			// Job successfully dispatched to worker
+			paths := getJobPaths(nextJob)
+			for _, path := range paths {
+				activePaths[path]++
+			}
+			activeWorkers++
+			// Remove from pending
+			pendingJobs = append(pendingJobs[:nextJobIdx], pendingJobs[nextJobIdx+1:]...)
+
+		case <-time.After(1 * time.Second):
+			// Safety timeout to avoid spinning too fast if everything is blocked
+			// Also allows checking exit conditions periodically
+		}
+	}
+
+	close(jobChan)
+	wg.Wait()
+
+	if p.cli.Verbose > 0 {
+		fmt.Fprint(os.Stderr, "\r\033[K")
+	}
+
+	// Wait for the simulation result if we don't have it yet
+	if finalSimFS == nil && simReturnChan != nil {
+		select {
+		case simResult := <-simReturnChan:
+			finalSimFS = simResult
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// Synchronize the simulated state back to destFS for the next source
+	if finalSimFS != nil {
+		destFS.mu.Lock()
+		destFS.nodes = finalSimFS.nodes
+		destFS.checked = finalSimFS.checked
+		destFS.mu.Unlock()
+	}
+
+	close(errChan)
+
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
+		if p.cli.Verbose > 0 {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("encountered %d errors during phase", len(errs))
+	}
+
+	return nil
+}
+
+func (p *Program) generateJobs(srcRoot string, srcFS *FileSystem, destFS *FileSystem, jobChan chan<- MergeJob, simReturn chan<- *FileSystem) {
+	defer close(jobChan)
+
 	simFS := NewFileSystem()
 	// Copy existing destination into simulation
 	destFS.mu.RLock()
@@ -150,6 +306,13 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 		simFS.checked[path] = true
 	}
 	destFS.mu.RUnlock()
+
+	defer func() {
+		select {
+		case simReturn <- simFS:
+		default:
+		}
+	}()
 
 	fileStrategy := parseFileOverFile(p.cli.FileOverFile)
 	isMove := !p.cli.Copy
@@ -167,11 +330,13 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	}
 	relRoot, err := filepath.Abs(relRoot)
 	if err != nil {
-		close(jobChan)
-		return err
+		fmt.Fprintf(os.Stderr, "Error getting absolute path for %s: %v\n", ShellQuote(relRoot), err)
+		return
 	}
 
-	destRoot := p.cli.Destination
+	pathChan := p.streamScan(srcRoot, srcFS)
+
+	destRoot, _ := filepath.Abs(p.cli.Destination)
 	isSourceDir := false
 	if info, err := os.Stat(srcRoot); err == nil && info.IsDir() {
 		isSourceDir = true
@@ -195,11 +360,8 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 				destExistsAsDir := false
 				if destNode, ok := destFS.Get(p.cli.Destination); ok && destNode.IsDir {
 					destExistsAsDir = true
-				} else {
-					// Fallback to direct stat if not cached
-					if info, err := os.Stat(p.cli.Destination); err == nil && info.IsDir() {
-						destExistsAsDir = true
-					}
+				} else if info, err := os.Stat(p.cli.Destination); err == nil && info.IsDir() {
+					destExistsAsDir = true
 				}
 
 				if strings.HasSuffix(p.cli.Destination, string(filepath.Separator)) || strings.HasSuffix(p.cli.Destination, "/") || destExistsAsDir {
@@ -213,17 +375,10 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 						existsAsFile := false
 						if destNode, ok := destFS.Get(p.cli.Destination); ok && !destNode.IsDir {
 							existsAsFile = true
-						} else {
-							// Fallback to direct stat
-							if info, err := os.Stat(p.cli.Destination); err == nil && !info.IsDir() {
-								existsAsFile = true
-							}
+						} else if info, err := os.Stat(p.cli.Destination); err == nil && !info.IsDir() {
+							existsAsFile = true
 						}
-						if existsAsFile {
-							appendBasename = false
-						} else {
-							appendBasename = true
-						}
+						appendBasename = !existsAsFile
 					}
 				}
 			}
@@ -233,7 +388,6 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 		}
 	}
 
-	// Capture initial stats before processing this source
 	initialFiles := atomic.LoadInt64(&p.stats.FilesMerged)
 	initialFolders := atomic.LoadInt64(&p.stats.FoldersMerged)
 	initialBytes := atomic.LoadInt64(&p.stats.BytesMoved)
@@ -246,10 +400,6 @@ outerloop:
 		var ok bool
 		select {
 		case <-p.sigChan:
-			if p.cli.Resume != "" {
-				fmt.Fprintf(os.Stderr, "\nInterrupt received. Saving remaining files...\n")
-				p.saveRemaining(srcRoot, pathChan)
-			}
 			os.Exit(130)
 		case srcPath, ok = <-pathChan:
 			if !ok {
@@ -274,10 +424,8 @@ outerloop:
 		}
 
 		srcNode, _ := srcFS.GetOrLoad(srcPath)
-
 		if !srcNode.IsDir {
 			if !p.shouldInclude(srcPath, srcNode) {
-				p.logDebug("Skipping %s (filtered out)", ShellQuote(srcPath))
 				continue
 			}
 		}
@@ -287,8 +435,8 @@ outerloop:
 			absSrcPath = srcPath
 		}
 
-		relPath, err := filepath.Rel(relRoot, absSrcPath)
-		if err != nil || strings.HasPrefix(relPath, "..") {
+		relPath, _ := filepath.Rel(relRoot, absSrcPath)
+		if strings.HasPrefix(relPath, "..") {
 			if p.cli.RelativeTo != "" {
 				continue
 			}
@@ -302,11 +450,8 @@ outerloop:
 			destPath = filepath.Join(destRoot, relPath)
 		}
 
-		// Update progress with current file
 		if p.cli.Verbose > 0 && !srcNode.IsDir {
 			p.progress.currentRel.Store(relPath)
-
-			// Print progress every 200ms to avoid excessive updates
 			now := time.Now()
 			if now.Sub(p.progress.lastPrintTime) > 200*time.Millisecond {
 				p.printProgress()
@@ -323,7 +468,6 @@ outerloop:
 		}
 
 		var jobOps []MergeOperation
-
 		hasFilters := len(p.cli.Ext) > 0 || len(p.cli.Include) > 0 || len(p.cli.Exclude) > 0 || len(p.cli.Size) > 0 || p.cli.Limit > 0 || maxBytes > 0
 
 		destNode, exists := simFS.GetOrLoad(destPath)
@@ -334,9 +478,8 @@ outerloop:
 
 		if exists {
 			if srcNode.IsDir && destNode.IsDir {
-				// Folder over folder - nothing to do here, will descend
+				// Folder over folder
 			} else if !srcNode.IsDir && !destNode.IsDir {
-				// File over file
 				atomic.AddInt64(&p.stats.FileOverFile, 1)
 				op.Copy = true
 				op.DeleteSrc = isMove
@@ -394,8 +537,6 @@ outerloop:
 
 		if op.Copy || op.DeleteSrc || op.DeleteDest {
 			jobOps = append(jobOps, op)
-
-			// Send job
 			jobChan <- MergeJob{Ops: jobOps, Root: destRoot}
 
 			if !op.IsDir {
@@ -411,36 +552,6 @@ outerloop:
 			}
 		}
 	}
-
-	close(jobChan)
-	wg.Wait()
-
-	// Clear progress line if verbose
-	if p.cli.Verbose > 0 {
-		fmt.Fprint(os.Stderr, "\r\033[K")
-	}
-
-	close(errChan)
-
-	var errs []error
-	for err := range errChan {
-		errs = append(errs, err)
-		if p.cli.Verbose > 0 {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("encountered %d errors during phase", len(errs))
-	}
-
-	// destFS is passed as pointer, but we made a new simFS. We need to sync back.
-	destFS.mu.Lock()
-	destFS.checked = simFS.checked
-	destFS.nodes = simFS.nodes
-	destFS.mu.Unlock()
-
-	return nil
 }
 
 func (p *Program) executeOperation(op MergeOperation, root string) error {
@@ -449,13 +560,12 @@ func (p *Program) executeOperation(op MergeOperation, root string) error {
 		finalDest = op.RenamedDestPath
 	}
 
-	// Fallback to simpler node if missing (e.g. usage in tests or renames)
 	node := op.SrcNode
 	if node == nil {
 		node = &FileNode{Path: op.SrcPath}
 	}
 
-	if p.cli.Verbose > 0 {
+	if p.cli.Verbose > 0 || p.cli.Simulate {
 		p.logOp(op, root)
 	}
 
@@ -488,17 +598,12 @@ func (p *Program) executeOperation(op MergeOperation, root string) error {
 		return fmt.Errorf("transfer %s -> %s: %w", ShellQuote(op.SrcPath), ShellQuote(finalDest), err)
 	}
 
-	p.logDebug("Completed %s -> %s (deleteSrc=%v)", ShellQuote(op.SrcPath), ShellQuote(finalDest), op.DeleteSrc)
-
 	return nil
 }
 
 func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMove bool, fs *FileSystem) error {
-	// Try rename first if moving
 	if isMove {
 		if err := os.Rename(srcPath, dstPath); err == nil {
-			// Success
-			p.logDebug("Rename successful: %s -> %s", ShellQuote(srcPath), ShellQuote(dstPath))
 			if node != nil && node.IsDir {
 				atomic.AddInt64(&p.stats.FoldersMerged, 1)
 			} else {
@@ -506,49 +611,34 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 			}
 			return nil
 		}
-		p.logDebug("Rename failed, falling back to copy+delete: %s -> %s", ShellQuote(srcPath), ShellQuote(dstPath))
-		// Fallback to copy+delete
 	}
 
-	// Copy logic (or fallback for move)
 	info, err := node.GetInfo()
 	if err != nil {
 		return err
 	}
 
-	// Handle Symlink
 	if info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(srcPath)
-		if err != nil {
-			return err
-		}
+		target, _ := os.Readlink(srcPath)
 		if err := os.Symlink(target, dstPath); err != nil {
 			return err
 		}
 		atomic.AddInt64(&p.stats.FilesMerged, 1)
-
 		if isMove {
 			return os.Remove(srcPath)
 		}
 		return nil
 	}
 
-	// Handle Directory
 	if info.IsDir() {
-		if err := os.MkdirAll(dstPath, info.Mode()); err != nil {
+		if err := os.MkdirAll(dstPath, info.Mode().Perm()); err != nil {
 			return err
 		}
-
-		entries, err := os.ReadDir(srcPath)
-		if err != nil {
-			return err
-		}
-
+		entries, _ := os.ReadDir(srcPath)
+		var errs []error
 		for _, entry := range entries {
 			childSrc := filepath.Join(srcPath, entry.Name())
 			childDst := filepath.Join(dstPath, entry.Name())
-
-			// Try to find cached node to avoid Lstat
 			var childNode *FileNode
 			if fs != nil {
 				childNode, _ = fs.Get(childSrc)
@@ -556,20 +646,27 @@ func (p *Program) performTransfer(srcPath, dstPath string, node *FileNode, isMov
 			if childNode == nil {
 				childNode = &FileNode{Path: childSrc}
 			}
-
 			if err := p.performTransfer(childSrc, childDst, childNode, isMove, fs); err != nil {
-				return err
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				errs = append(errs, err)
+				continue
 			}
 		}
 		atomic.AddInt64(&p.stats.FoldersMerged, 1)
-
 		if isMove {
-			return os.Remove(srcPath)
+			if len(errs) > 0 {
+				return fmt.Errorf("failed to move directory %s: %v", ShellQuote(srcPath), errs)
+			}
+			return os.RemoveAll(srcPath)
 		}
 		return nil
 	}
 
-	// Handle Regular File
+	if !info.Mode().IsRegular() {
+		p.logDebug("Skipping special file: %s (mode %v)", ShellQuote(srcPath), info.Mode())
+		return nil
+	}
+
 	if err := copyFile(srcPath, dstPath); err != nil {
 		return err
 	}
@@ -613,20 +710,15 @@ func (p *Program) streamScan(root string, fs *FileSystem) <-chan string {
 		defer close(out)
 		absRoot, _ := filepath.Abs(root)
 		destAbs, _ := filepath.Abs(p.cli.Destination)
-
 		filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
-
 			if d.IsDir() && path == destAbs {
 				return filepath.SkipDir
 			}
 
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
+			info, _ := d.Info()
 
 			node := &FileNode{
 				Path:       path,
@@ -636,33 +728,9 @@ func (p *Program) streamScan(root string, fs *FileSystem) <-chan string {
 				infoLoaded: true,
 			}
 			fs.Add(path, node)
-
 			out <- path
 			return nil
 		})
 	}()
 	return out
-}
-
-func (p *Program) saveRemaining(srcRoot string, paths <-chan string) {
-	name := p.cli.Resume
-	if name == "" {
-		name = filepath.Base(srcRoot) + ".remainingfiles"
-	}
-	f, err := os.Create(name)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to write remaining file: %v\n", err)
-		return
-	}
-	defer f.Close()
-
-	for path := range paths {
-		rel, err := filepath.Rel(srcRoot, path)
-		if err == nil {
-			fmt.Fprintln(f, rel)
-		} else {
-			fmt.Fprintln(f, path)
-		}
-	}
-	fmt.Fprintf(os.Stderr, "\nRemaining paths saved to: %s\n", name)
 }

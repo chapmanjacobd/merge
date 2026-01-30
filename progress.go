@@ -27,7 +27,7 @@ func (p *Program) logOp(op MergeOperation, root string) {
 		}
 	}
 
-	if p.cli.Verbose < 2 {
+	if p.cli.Verbose < 2 && !p.cli.Simulate {
 		return
 	}
 
@@ -46,14 +46,39 @@ func (p *Program) logOp(op MergeOperation, root string) {
 		}
 	}
 
+	sizeStr := ""
+	if !op.IsDir {
+		node := op.SrcNode
+		if node == nil {
+			node = &FileNode{Path: op.SrcPath}
+		}
+		if sz, err := node.GetSize(); err == nil {
+			sizeStr = fmt.Sprintf(" (%s)", bytes2human(sz))
+		}
+	}
+
 	if action != "" {
-		fmt.Fprintf(os.Stderr, "\n%-10s %s", action, ShellQuote(rel))
+		p.printLog(fmt.Sprintf("%-10s %s%s", action, ShellQuote(rel), sizeStr))
 	}
 }
 
 func (p *Program) logDebug(format string, a ...interface{}) {
 	if p.cli.Verbose >= 2 {
-		fmt.Fprintf(os.Stderr, "\nDEBUG: "+format, a...)
+		p.printLog(fmt.Sprintf("DEBUG: "+format, a...))
+	}
+}
+
+func (p *Program) printLog(msg string) {
+	p.clearProgress()
+	fmt.Fprintln(os.Stderr, msg)
+	// Optionally reprint progress immediately?
+	// Usually better to let the next ticker handle it to avoid flickering,
+	// unless the log rate is low.
+}
+
+func (p *Program) clearProgress() {
+	if p.cli.Verbose > 0 {
+		fmt.Fprint(os.Stderr, "\r\033[K")
 	}
 }
 
@@ -99,6 +124,7 @@ func (p *Program) printProgress() {
 		status += " | " + truncateMiddle(cur, remaining)
 	}
 
+	// assume line is either empty or we are overwriting previous progress
 	fmt.Fprint(os.Stderr, "\r"+status+"\033[K")
 	p.progress.lastPrintTime = time.Now()
 }

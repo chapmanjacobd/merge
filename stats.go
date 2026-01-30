@@ -24,8 +24,6 @@ func (s *Stats) Print() {
 	fileOverFolder := atomic.LoadInt64(&s.FileOverFolder)
 	folderOverFile := atomic.LoadInt64(&s.FolderOverFile)
 	bytesMoved := atomic.LoadInt64(&s.BytesMoved)
-	sampleHashes := atomic.LoadInt64(&s.SampleHashes)
-	fullHashes := atomic.LoadInt64(&s.FullHashes)
 	errors := atomic.LoadInt64(&s.Errors)
 
 	plural := "files"
@@ -45,9 +43,6 @@ func (s *Stats) Print() {
 		fmt.Printf("  %d folder over file conflicts\n", folderOverFile)
 	}
 	fmt.Printf("  %d bytes moved\n", bytesMoved)
-	if sampleHashes > 0 || fullHashes > 0 {
-		fmt.Printf("  %d sample hashes, %d full hashes\n", sampleHashes, fullHashes)
-	}
 	if errors > 0 {
 		fmt.Printf("  %d errors\n", errors)
 	}

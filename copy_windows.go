@@ -31,7 +31,9 @@ func copyFile(src, dst string) error {
 	defer out.Close()
 
 	if _, err = io.Copy(out, in); err != nil {
-		_ = os.Remove(dst)
+		if _, err := os.Stat(src); err == nil {
+			_ = os.Remove(dst)
+		}
 		return err
 	}
 

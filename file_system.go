@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -35,6 +36,18 @@ func (fs *FileSystem) Exists(path string) bool {
 func (fs *FileSystem) Delete(path string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+
+	// Recursively remove children if this is a directory
+	if node, ok := fs.nodes[path]; ok && node.IsDir {
+		prefix := path + string(filepath.Separator)
+		for p := range fs.nodes {
+			if strings.HasPrefix(p, prefix) {
+				delete(fs.nodes, p)
+				fs.checked[p] = true
+			}
+		}
+	}
+
 	delete(fs.nodes, path)
 	fs.checked[path] = true
 }
