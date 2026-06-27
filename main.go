@@ -1,4 +1,4 @@
-package main
+package merge
 
 import (
 	"fmt"
@@ -11,8 +11,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/alecthomas/kong"
 )
 
 var (
@@ -20,7 +18,7 @@ var (
 	commit  = "none"
 )
 
-func getVersion() string {
+func GetVersion() string {
 	if info, ok := debug.ReadBuildInfo(); ok {
 		if version == "dev" && info.Main.Version != "" && info.Main.Version != "(devel)" {
 			version = info.Main.Version
@@ -76,17 +74,7 @@ func NewProgram(cli *CLI) *Program {
 	return p
 }
 
-func main() {
-	cli := &CLI{}
-	kong.Parse(cli,
-		kong.Name("merge"),
-		kong.Description("Merge folders with apriori conflict resolution"),
-		kong.UsageOnError(),
-		kong.Vars{
-			"version": getVersion(),
-		},
-	)
-
+func Run(cli *CLI) error {
 	p := NewProgram(cli)
 
 	// Scan destination, add it to destFS so conflicts are detected
@@ -96,15 +84,14 @@ func main() {
 	// Process each source
 	for _, src := range cli.Sources {
 		if _, err := os.Stat(src); err != nil {
-			fmt.Fprintf(os.Stderr, "Source %s does not exist\n", ShellQuote(src))
-			continue
+			return fmt.Errorf("source %s does not exist", ShellQuote(src))
 		}
 
 		srcFS := NewFileSystem()
 		// Stream parallel processing
 		err := p.processSource(src, srcFS, destFS)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error processing source %s: %v\n", ShellQuote(src), err)
+			return err
 		}
 
 		// Clean up empty directories
@@ -116,6 +103,8 @@ func main() {
 	if cli.Verbose > 0 {
 		p.stats.Print()
 	}
+
+	return nil
 }
 
 func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileSystem) error {
@@ -136,7 +125,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 
 	// Start workers
 	p.logDebug("Starting %d workers", numWorkers)
-	for i := 0; i < numWorkers; i++ {
+	for range numWorkers {
 		wg.Go(func() {
 			for job := range jobChan {
 				for _, op := range job.Ops {

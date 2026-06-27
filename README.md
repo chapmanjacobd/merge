@@ -4,7 +4,7 @@ A high-performance Go implementation for merging folders with preconfigured conf
 
 ## Install
 
-    go install github.com/chapmanjacobd/merge@latest
+    go install github.com/chapmanjacobd/merge/cmd/merge@latest
 
 ## Features
 
