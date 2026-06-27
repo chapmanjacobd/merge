@@ -128,10 +128,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	}
 
 	// 2. Execution Phase
-	numWorkers := p.cli.Workers
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
+	numWorkers := max(p.cli.Workers, 1)
 	jobChan := make(chan MergeJob) // Unbuffered
 	doneChan := make(chan MergeJob, numWorkers*2)
 	errChan := make(chan error, 128)
@@ -140,9 +137,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 	// Start workers
 	p.logDebug("Starting %d workers", numWorkers)
 	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for job := range jobChan {
 				for _, op := range job.Ops {
 					if err := p.executeOperation(op, job.Root); err != nil {
@@ -159,7 +154,7 @@ func (p *Program) processSource(srcRoot string, srcFS *FileSystem, destFS *FileS
 				}
 				doneChan <- job
 			}
-		}()
+		})
 	}
 
 	// Scheduler State

@@ -79,20 +79,20 @@ func checkSizeConstraint(size int64, constraint string) bool {
 	}
 
 	// Handle comparison operators
-	if strings.HasPrefix(constraint, ">") {
-		threshold := humanToBytes(strings.TrimPrefix(constraint, ">"))
+	if after, ok := strings.CutPrefix(constraint, ">"); ok {
+		threshold := humanToBytes(after)
 		return size > threshold
 	}
-	if strings.HasPrefix(constraint, "<") {
-		threshold := humanToBytes(strings.TrimPrefix(constraint, "<"))
+	if after, ok := strings.CutPrefix(constraint, "<"); ok {
+		threshold := humanToBytes(after)
 		return size < threshold
 	}
-	if strings.HasPrefix(constraint, "+") {
-		threshold := humanToBytes(strings.TrimPrefix(constraint, "+"))
+	if after, ok := strings.CutPrefix(constraint, "+"); ok {
+		threshold := humanToBytes(after)
 		return size > threshold
 	}
-	if strings.HasPrefix(constraint, "-") {
-		threshold := humanToBytes(strings.TrimPrefix(constraint, "-"))
+	if after, ok := strings.CutPrefix(constraint, "-"); ok {
+		threshold := humanToBytes(after)
 		return size <= threshold
 	}
 

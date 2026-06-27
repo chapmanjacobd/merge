@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-type testTree map[string]interface{}
+type testTree map[string]any
 
 func createTestTree(t *testing.T, root string, tree testTree) {
 	for name, content := range tree {
@@ -1392,7 +1392,7 @@ func TestMultipleSourcesRace(t *testing.T) {
 	numFiles := 50 // Enough to likely trigger race with parallel workers
 
 	// Setup src1
-	for i := 0; i < numFiles; i++ {
+	for i := range numFiles {
 		// Case 1: Standard File (File Over File)
 		fname := fmt.Sprintf("file_%d", i)
 		if err := os.WriteFile(filepath.Join(src1, fname), []byte("src1"), 0o644); err != nil {
@@ -1410,7 +1410,7 @@ func TestMultipleSourcesRace(t *testing.T) {
 	}
 
 	// Setup src2
-	for i := 0; i < numFiles; i++ {
+	for i := range numFiles {
 		// Case 1: File Over File (Existing chain)
 		// file_i: will conflict with dest/file_i (from src1), causing dest/file_i -> dest/file_i_1
 		fname := fmt.Sprintf("file_%d", i)

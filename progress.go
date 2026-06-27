@@ -62,7 +62,7 @@ func (p *Program) logOp(op MergeOperation, root string) {
 	}
 }
 
-func (p *Program) logDebug(format string, a ...interface{}) {
+func (p *Program) logDebug(format string, a ...any) {
 	if p.cli.Verbose >= 2 {
 		p.printLog(fmt.Sprintf("DEBUG: "+format, a...))
 	}
